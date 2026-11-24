@@ -121,6 +121,13 @@ pub fn status_bar_pro(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         app.ui.views[i].fit_pending = false;
     }
     ui.add_space(12.0);
+    // Cursor position over the canvas, in image pixels (origin top-left), always visible.
+    let cursor = match app.hover_doc {
+        Some(p) => format!("X: {}   Y: {}", p[0].floor() as i64, p[1].floor() as i64),
+        None => "X: -   Y: -".to_string(),
+    };
+    ui.label(RichText::new(cursor).color(t.text).size(13.0).monospace());
+    ui.add_space(12.0);
     ui.label(RichText::new(tl!(&text)).color(t.text_dim).size(12.0));
     let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
     if resp.hovered() {
