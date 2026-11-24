@@ -28,31 +28,34 @@ pub type StyleAttrs = Map<String, Value>;
 const REF_KEY: &str = "style_sheet";
 
 /// A named character style.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 #[serde(default)]
 pub struct CharacterStyleDef {
     /// Stable id (≥ 1), referenced by [`CharStyle::style_sheet`].
     pub id: u32,
     pub name: String,
     /// Character attributes this style sets (others come from the paragraph style).
+    #[plain_data(assume = "JSON values: plain data")]
     pub attrs: StyleAttrs,
 }
 
 /// A named paragraph style (or Basic Paragraph).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 #[serde(default)]
 pub struct ParagraphStyleDef {
     /// Stable id (≥ 1; Basic Paragraph is 0), referenced by [`ParagraphStyle::style_sheet`].
     pub id: u32,
     pub name: String,
     /// Paragraph attributes this style sets.
+    #[plain_data(assume = "JSON values: plain data")]
     pub para_attrs: StyleAttrs,
     /// Character attributes this style sets (the basis of every run in its paragraphs).
+    #[plain_data(assume = "JSON values: plain data")]
     pub char_attrs: StyleAttrs,
 }
 
 /// The document's named type styles.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 #[serde(default)]
 pub struct TextStyles {
     /// Character styles in panel order ("None" is implicit and first).
@@ -63,6 +66,7 @@ pub struct TextStyles {
     pub basic: ParagraphStyleDef,
     /// Style sheets of the PSD text engine this document was read from (`ResourceDict`
     /// `StyleSheetSet` / `ParagraphSheetSet`), kept so unmapped data survives a round trip.
+    #[plain_data(assume = "JSON value: plain data")]
     pub psd_raw: Option<Value>,
 }
 
@@ -155,14 +159,14 @@ impl TextStyles {
         if id == 0 { Some(&mut self.basic) } else { self.paragraph.iter_mut().find(|s| s.id == id) }
     }
 
-    /// A fresh character style id.
-    pub fn next_char_id(&self) -> u32 {
-        self.character.iter().map(|s| s.id).max().unwrap_or(0) + 1
+    /// A fresh character style id, or `None` when the stored ids exhaust the `u32` id space.
+    pub fn next_char_id(&self) -> Option<u32> {
+        self.character.iter().map(|s| s.id).max().unwrap_or(0).checked_add(1)
     }
 
-    /// A fresh paragraph style id.
-    pub fn next_para_id(&self) -> u32 {
-        self.paragraph.iter().map(|s| s.id).max().unwrap_or(0) + 1
+    /// A fresh paragraph style id, or `None` when the stored ids exhaust the `u32` id space.
+    pub fn next_para_id(&self) -> Option<u32> {
+        self.paragraph.iter().map(|s| s.id).max().unwrap_or(0).checked_add(1)
     }
 
     /// "Character Style N" / "Paragraph Style N" with the first unused N.
@@ -312,12 +316,23 @@ mod tests {
     fn names_and_ids() {
         let s = styles();
         assert_eq!(s.unique_name(false, "Character Style"), "Character Style 1");
-        assert_eq!((s.next_char_id(), s.next_para_id()), (2, 2));
+        assert_eq!((s.next_char_id(), s.next_para_id()), (Some(2), Some(2)));
         assert_eq!(s.para_style(0).unwrap().name, BASIC_PARAGRAPH);
         let v = serde_json::to_value(&s).unwrap();
         let back: TextStyles = serde_json::from_value(v).unwrap();
         assert_eq!(back, s);
         let empty: TextStyles = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.basic.name, BASIC_PARAGRAPH);
+    }
+
+    #[test]
+    fn exhausted_style_ids_survive_serialization() {
+        let mut s = TextStyles::default();
+        s.character.push(CharacterStyleDef { id: u32::MAX, ..Default::default() });
+        s.paragraph.push(ParagraphStyleDef { id: u32::MAX, ..Default::default() });
+        let value = serde_json::to_value(&s).unwrap();
+        let loaded: TextStyles = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.next_char_id(), None);
+        assert_eq!(loaded.next_para_id(), None);
     }
 }

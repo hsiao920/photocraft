@@ -147,9 +147,12 @@ impl GalleryFilter {
         out
     }
 
-    /// Whether the filter reads the foreground / background colours.
+    /// Whether the filter reads the foreground / background colours. Derived
+    /// from the params notation, plus the filters whose pixel code reads the
+    /// colours without listing them (issue #709): Colored Pencil uses the
+    /// background as paper tint, Neon Glow mixes foreground over background.
     pub fn uses_colours(self) -> bool {
-        self.params_doc().contains("\"foreground\"") || self.params_doc().contains("\"background\"")
+        matches!(self, Self::ColoredPencil | Self::NeonGlow) || self.params_doc().contains("\"foreground\"") || self.params_doc().contains("\"background\"")
     }
 }
 
@@ -231,6 +234,19 @@ impl GalleryEffect {
             Some(GalleryParamKind::Bool(b)) => b as u8 as f32,
             _ => 0.0,
         }
+    }
+
+    /// A copy whose stored numeric values are held to their declared ranges (a non-finite value
+    /// becomes the default). A project file stores `values` as plain numbers, so unlike
+    /// [`Self::set`] nothing has clamped them; geometry sized from them (reach) needs it.
+    pub(crate) fn clamped(&self) -> GalleryEffect {
+        let mut out = self.clone();
+        for p in self.filter.params() {
+            if let (GalleryParamKind::Range { min, max, default }, Some(v)) = (&p.kind, out.values.get_mut(p.key)) {
+                *v = if v.is_finite() { v.clamp(*min, *max) } else { *default };
+            }
+        }
+        out
     }
 
     /// A bool value.

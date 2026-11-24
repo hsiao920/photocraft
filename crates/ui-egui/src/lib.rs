@@ -1,11 +1,22 @@
-//! Photocraft's first UI shell, built on egui/eframe.
+//! PhotoCraft's first UI shell, built on egui/eframe.
 //!
 //! This crate is deliberately thin. Every action goes through
 //! [`photocraft_engine::Session::execute`], and all UI state lives in [`state::UiState`] (plain
 //! data). The [`control`] module exposes both to automation, so agents can drive and inspect every
 //! part of the interface.
 #![forbid(unsafe_code)]
+// `control::inspect` builds the whole UI snapshot in one `json!`, past the default limit of 128.
+#![recursion_limit = "256"]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+/// PhotoCraft as craft-update knows it, with its 128 px icon and accent colour: the update
+/// prompt shows both, and an AppImage's menu entry gets the icon.
+#[cfg(not(target_arch = "wasm32"))]
+pub const UPDATE_APP: craft::update::app::App = craft::update::app::App {
+    icon_png: Some(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.photocraft.png")),
+    accent: Some([0x2f, 0x7b, 0xf5]),
+    ..craft::update::suite::PHOTOCRAFT
+};
 
 /// Translate a string literal into the current UI language: `tl!("Image Size…")`.
 macro_rules! tl {
@@ -13,1302 +24,1075 @@ macro_rules! tl {
         $crate::i18n::t($s)
     };
 }
-
-pub mod actions;
-pub mod adjust_dialog;
-pub mod adjust_editors;
-pub mod adjust_preview;
-pub mod adjust_ui;
-pub mod analysis_ui;
-pub mod artboard_ui;
-pub mod brush_panel;
-pub mod brush_picker;
-pub mod brush_preview;
-pub mod brush_resize;
-pub mod brush_sections;
-pub mod brushes_tab;
-pub mod camera_raw_ui;
+mod brush_mode_menu;
 pub mod canvas;
-pub mod channel_view;
-pub mod channels_panel;
-pub mod chrome_ui;
-pub mod cjk_fonts;
-pub mod color_picker_ui;
-pub mod color_range_ui;
-pub mod comps_ui;
+mod channel_titles;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod control;
-pub mod crop_ui;
 pub mod dialogs;
-pub mod discard_ui;
-pub mod distort_ui;
-pub mod doc_props_ui;
 pub mod dock;
-pub mod enable_rules;
-pub mod eraser_ui;
-pub mod export_dialog;
+pub(crate) mod edit_session;
+pub mod file_dialog;
 pub mod file_open;
-pub mod file_ui;
-pub mod fill_ui;
-pub mod filter_dialog;
-pub mod gallery_ui;
-pub mod gpu_canvas;
+pub mod frame_stages;
+pub mod gpu_memo;
 pub mod gpu_status;
-pub mod gradient_ui;
-pub mod hold_keys;
+mod history_keys;
+pub mod home_recent_ui;
 pub mod i18n;
 mod icon_data;
 pub mod icons;
-pub mod layer_menu_ui;
-pub mod layer_props_ui;
-mod layer_reveal;
-pub mod layer_row_ui;
-pub mod layer_style;
-pub mod layer_tree_ui;
+pub mod jobs_ui;
+pub(crate) mod last_brush;
+pub mod levels_clipping;
 pub mod links;
-pub mod liquify_ui;
-pub mod mask_thumbs_ui;
+pub mod memory_warning;
 pub mod menu_catalog;
-pub mod menu_nav;
 pub mod menus;
-pub mod move_mods;
-pub mod move_ui;
-pub mod new_doc_ui;
+mod modifier_keys;
+pub mod monitor_status;
 pub mod notices;
-pub mod outline;
-pub mod paint_mouse;
-pub mod palette;
+pub mod os_window;
 pub mod panels;
-pub mod parity;
-pub mod perspective_ui;
-pub mod plugin_ui;
-pub mod prefs_ui;
 pub mod preset_files_ui;
-pub mod preset_panels;
-pub mod props_layout;
 pub mod proxy;
-pub mod puppet_ui;
-pub mod rasterize_prompt;
-pub mod retouch_ui;
-pub mod rulers;
-pub mod shortcut_dispatch;
-pub mod shortcuts;
-mod sizing;
-pub mod slice_ui;
-pub mod smart_ui;
-pub mod snap_ui;
+pub mod render_path;
+pub(crate) mod scratch_reads;
 pub mod state;
-pub mod stroke_constraint;
-pub mod stroke_trail;
-pub mod stylus;
-mod tab_strip;
+pub mod texel_guard;
 pub mod theme;
-mod timeline_ui;
 pub mod tone;
-pub mod tool_feedback;
-pub mod transform_tex;
-pub mod transform_tool;
-pub mod type_panels_ui;
-pub mod type_tool;
-mod variables_ui;
-pub mod vector_ui;
-pub mod view_cmds;
-pub mod wide_angle_ui;
-pub mod widgets;
-pub mod workspace_ui;
-pub mod zoom_tool;
+pub(crate) mod tool_memory;
+pub mod updates_ui;
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
 
 use photocraft_doc::{DocId, Document};
 use photocraft_engine::Session;
-use serde_json::Value;
+use serde_json::{Value, json};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use control::{ControlRequest, ControlResponse};
+pub use craft::window::{
+    Prefix,
+    policy::{self as window_policy, Backend, Decision, Frame, TitleBarPref},
+};
+#[cfg(target_arch = "wasm32")]
+pub use file_dialog::{FileDialogAnswer, FileDialogFn, FileDialogReply, FileDialogRequest};
 pub use file_open::OsEvent;
 pub use state::{Tool, UiState};
 
-/// Decode a file: (document, warnings about anything approximated or dropped).
-pub type ImportFn = Box<dyn Fn(&str, &[u8]) -> Result<(Document, Vec<String>), String>>;
-/// Encoder settings chosen in Export As (the file format comes from the name's extension).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ExportSettings {
-    /// JPEG quality 1–100 (None = codec default).
-    pub jpeg_quality: Option<u8>,
-}
+mod app;
+mod input;
+mod prefs;
+mod services;
+#[cfg(not(target_arch = "wasm32"))]
+mod smart_svg_ui;
+#[cfg(target_arch = "wasm32")]
+#[path = "smart_svg_ui/browser.rs"]
+mod smart_svg_ui;
+mod text;
+mod tools;
 
-/// Encode a document: (file bytes, warnings about anything approximated or dropped).
-pub type ExportFn = Box<dyn Fn(&Document, &str, &ExportSettings) -> Result<(Vec<u8>, Vec<String>), String>>;
-pub type PickOpenFn = Box<dyn FnMut() -> Option<(String, Vec<u8>)>>;
-pub type PickSaveFn = Box<dyn FnMut(&str) -> Option<String>>;
-pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
-/// Read bytes through the desktop control session's authorized read root.
-pub type AutomationReadFn = Box<dyn FnMut(&str) -> Result<(String, Vec<u8>), String>>;
-/// Write bytes through the desktop control session's authorized write root.
-pub type AutomationWriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
-/// Reject engine commands which still perform ambient filesystem I/O.
-pub type AutomationCommandFn = Box<dyn Fn(&str, &Value) -> Result<(), String>>;
-/// Open a URL in the system browser (native) — reliable cross-platform, unlike `ctx.open_url`.
-pub type OpenUrlFn = Box<dyn Fn(&str) -> Result<(), String>>;
-pub type EncodePngFn = Box<dyn Fn(u32, u32, &[u8]) -> Result<Vec<u8>, String>>;
-/// Put an RGBA8 image (width, height, pixels) on the OS clipboard.
-pub type ClipboardSetFn = Box<dyn FnMut(u32, u32, &[u8]) -> Result<(), String>>;
-/// Read an RGBA8 image from the OS clipboard.
-pub type ClipboardGetFn = Box<dyn FnMut() -> Option<(u32, u32, Vec<u8>)>>;
-/// Shared queue of (file name, bytes) delivered asynchronously.
-pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
-/// Read the saved preferences text (`None` when there is none yet).
-pub type LoadTextFn = Box<dyn FnMut() -> Option<String>>;
-/// Persist the preferences text.
-pub type SaveTextFn = Box<dyn FnMut(&str) -> Result<(), String>>;
-/// Autosave a document snapshot for crash recovery: (snapshot, revision, original path).
-pub type AutosaveFn = Box<dyn FnMut(&std::sync::Arc<Document>, u64, Option<&str>) -> Result<(), String>>;
-/// Drop the recovery data of a document (by `DocId` value) once it is saved or closed.
-pub type DiscardAutosaveFn = Box<dyn FnMut(u64)>;
-/// Load recoverable documents left by a previous session: (original path, document).
-pub type RecoverFn = Box<dyn FnMut() -> Vec<(Option<String>, Document)>>;
-/// Append text to a file (History Log).
-pub type AppendTextFn = Box<dyn FnMut(&str, &str) -> Result<(), String>>;
-/// Requests from the operating system since the last call (see [`OsEvent`]).
-pub type OsEventsFn = Box<dyn FnMut() -> Vec<OsEvent>>;
+pub(crate) use app::adjustment_layer_active;
+#[cfg(test)]
+use app::layer_thumb_frame;
+pub use canvas::artboard_ui;
+pub(crate) use canvas::background_redraw;
+pub(crate) use canvas::cam_preview;
+pub use canvas::canvas_tool_menu;
+pub use canvas::channel_view;
+pub use canvas::gpu_canvas;
+pub use canvas::guide_select;
+pub use canvas::layer_pick_ui;
+pub use canvas::move_ui;
+pub use canvas::outline;
+pub use canvas::paint_mouse;
+pub use canvas::patch_preview;
+pub use canvas::quick_pick;
+pub use canvas::rulers;
+pub use canvas::sampling;
+pub use canvas::scroll_all_windows;
+pub use canvas::select_mask_view;
+pub use canvas::snap_ui;
+pub use canvas::tool_feedback;
+pub use dialogs::adjust_dialog;
+pub use dialogs::adjust_editors;
+pub use dialogs::adjust_preview;
+pub(crate) use dialogs::bitmap_dialog;
+pub use dialogs::blur_pins;
+pub use dialogs::brush_preset_dialog;
+pub use dialogs::caf_ui;
+use dialogs::camera_raw_gpu;
+pub use dialogs::camera_raw_ui;
+pub use dialogs::channel_options_ui;
+pub(crate) use dialogs::color_picker_preview;
+pub use dialogs::color_picker_ui;
+pub use dialogs::color_range_ui;
+pub use dialogs::color_table_ui;
+pub use dialogs::count_group_name_ui;
+pub use dialogs::credits;
+pub use dialogs::dds_options_ui;
+pub use dialogs::delete_layer_prompt;
+pub use dialogs::discard_ui;
+pub use dialogs::disk_change_prompt;
+pub use dialogs::distort_ui;
+pub use dialogs::duplicate_layer_ui;
+pub use dialogs::equalize_ui;
+pub use dialogs::export_dialog;
+pub use dialogs::file_ui;
+pub use dialogs::fill_ui;
+pub use dialogs::filter_dialog;
+use dialogs::filter_preview_ui;
+pub(crate) use dialogs::format_prompts;
+pub use dialogs::gallery_ui;
+use dialogs::guide_edit;
+pub use dialogs::guide_layout_ui;
+pub use dialogs::history_options_ui;
+pub use dialogs::jpeg_options_ui;
+pub use dialogs::layer_picker;
+pub use dialogs::layer_style;
+pub use dialogs::liquify_ui;
+pub use dialogs::mask_trash_prompt;
+pub use dialogs::new_doc_ui;
+pub use dialogs::new_group_ui;
+pub use dialogs::new_guide_ui;
+pub use dialogs::new_layer_ui;
+pub use dialogs::open_prompt;
+pub use dialogs::palette;
+pub(crate) use dialogs::pattern_fill_ui;
+pub use dialogs::preset_group_prompt;
+pub use dialogs::rasterize_prompt;
+pub use dialogs::screen_picker;
+pub use dialogs::select_mask_ui;
+pub use dialogs::shape_dialog;
+pub(crate) use dialogs::shape_fill_ui;
+use dialogs::sizing;
+pub use dialogs::smart_filter_dialog;
+pub use dialogs::snapshot_dialog;
+pub(crate) use dialogs::solid_fill_ui;
+pub use dialogs::stack_dialog;
+pub use dialogs::stroke_ui;
+pub use dialogs::targa_options_ui;
+pub use dialogs::tiff_options_ui;
+pub use dialogs::vp_ui;
+pub use dialogs::wide_angle_ui;
+use input::alt_grab;
+use input::blend_keys;
+pub use input::hold_keys;
+pub use input::nudge_bundle;
+use input::opacity_keys;
+pub use input::shortcut_dispatch;
+pub use input::shortcuts;
+pub use input::spring_tools;
+pub use input::stylus;
+use input::tool_shortcuts;
+pub use input::touch_twins;
+pub use input::window_keys;
+pub use menus::enable_rules;
+pub use menus::native_menu;
+pub use menus::parity;
+pub use menus::plugin_ui;
+pub use menus::view_cmds;
+pub use menus::workspace_ui;
+pub use panels::actions;
+pub use panels::adjust_ui;
+pub use panels::apply_color;
+pub(crate) use panels::blend_preview;
+pub use panels::brush_panel;
+pub use panels::brush_preview;
+pub use panels::brush_sections;
+pub use panels::channels_panel;
+pub use panels::chrome_ui;
+pub use panels::clip_line_ui;
+pub use panels::color_hud;
+pub use panels::color_panel_ui;
+pub use panels::comps_ui;
+pub use panels::doc_props_ui;
+pub use panels::histogram_panel;
+pub use panels::history_menu_ui;
+pub use panels::layer_filter_ui;
+pub use panels::layer_menu_ui;
+pub use panels::layer_props_ui;
+use panels::layer_reveal;
+pub use panels::layer_row_ui;
+use panels::layer_transfer;
+pub use panels::layers_panel_ui;
+use panels::mask_props_ui;
+pub use panels::mask_thumbs_ui;
+use panels::panel_docking;
+pub use panels::preset_panels;
+pub use panels::smart_ui;
+pub use panels::swatches_ui;
+use panels::timeline_ui;
+pub use panels::type_panels_ui;
+use panels::variables_ui;
+pub use prefs::kys_import;
+pub use prefs::prefs_ui;
+use prefs::pressure_curve_ui;
+#[cfg(not(target_arch = "wasm32"))]
+pub use services::AgentAutomationFn;
+pub use services::AutomationReadResult;
+pub(crate) use services::SAVE_OPTIONS_OPEN;
+#[cfg(test)]
+pub(crate) use services::saved_revision_after_write;
+pub use services::{
+    AdoptAutosaveFn, AppendTextFn, AutomationAuthorizeFn, AutomationCommandFn, AutomationLocateFn, AutomationOpenPcraftFn, AutomationReadFn,
+    AutomationServices, AutomationWriteFn, AutosaveFn, AutosaveResultsFn, CapsLockFn, ClipboardGetFn, ClipboardGetSvgFn, ClipboardSetFn, ClipboardUnreadableFn,
+    CursorPosFn, DiscardAutosaveFn, ExportFn, ExportSettings, ExternalSvgEditor, ExternalSvgSession, ExternalVectorSave, ExternalVectorSource, FileStamp,
+    FileStampFn, FormatChoices, ImportFn, Inbox, LoadTextFn, OpenExternalSvgFn, OpenUrlFn, OsEventsFn, PenEndFn, PhotoshopShortcutsFn, PlaceInbox,
+    PrimaryDownFn, RecoverFn, Recoverable, RightButtonDownFn, SameFileFn, SaveFileFn, SaveTextFn, Services, SystemThemeFn, TabletPollFn, WindowFrameFn,
+    WriteFn,
+};
+pub(crate) use services::{opaque_layer, saves_flat_in_place};
+pub use text::cjk_fonts;
+pub use text::direction;
+pub use text::served_fonts;
+pub use tools::adjustment_brush;
+use tools::align_bar;
+pub use tools::analysis;
+pub use tools::artboard_tool;
+pub use tools::bg_eraser_popup;
+pub(crate) use tools::brush_cursor;
+pub use tools::brush_picker;
+pub use tools::brush_refusal;
+pub use tools::brush_resize;
+use tools::cam_transform;
+pub use tools::cas_transform;
+pub use tools::crop_presets;
+pub use tools::crop_task_bar;
+pub use tools::crop_ui;
+pub use tools::direct_select;
+pub use tools::eraser_ui;
+pub use tools::eyedropper_ui;
+pub use tools::frame_tool;
+pub use tools::gradient_ui;
+pub use tools::magnetic_lasso_ui;
+pub use tools::move_box;
+pub use tools::move_distance;
+pub use tools::move_hover;
+pub use tools::move_lock;
+pub use tools::move_mods;
+pub use tools::object_finder;
+pub use tools::option_cells;
+use tools::paint_picker;
+use tools::path_components;
+pub use tools::perspective_crop_ui;
+pub use tools::perspective_ui;
+pub use tools::puppet_ui;
+pub use tools::retouch_ui;
+pub use tools::shape_controls;
+use tools::shape_gradient_ui;
+use tools::shape_options;
+use tools::shape_paint_ui;
+pub use tools::shape_stroke_ui;
+pub use tools::slice_ui;
+pub use tools::stroke_constraint;
+pub use tools::stroke_trace;
+pub use tools::stroke_trail;
+pub use tools::symmetry_ui;
+use tools::tool_reset;
+pub use tools::transform_fx;
+pub use tools::transform_task_bar;
+pub use tools::transform_tool;
+use tools::type_box_preview;
+use tools::type_font_preview;
+use tools::type_path_placement;
+pub use tools::type_tool;
+use tools::type_transform;
+pub use tools::vector_ui;
 
-/// Platform services injected by the app binary (file dialogs, codecs), keeping this crate free of
-/// I/O dependencies.
-#[derive(Default)]
-pub struct Services {
-    /// Decode a file's bytes into a document (PSD, PNG, JPEG, …).
-    pub import: Option<ImportFn>,
-    /// Encode a document for a file name (format chosen by extension).
-    pub export: Option<ExportFn>,
-    /// Show an "open file" dialog; returns (name, bytes).
-    pub pick_open: Option<PickOpenFn>,
-    /// Show a "save file" dialog; returns a path/name to write.
-    pub pick_save: Option<PickSaveFn>,
-    /// Write bytes to a path (native) or trigger a download (web).
-    pub write: Option<WriteFn>,
-    /// File access used only by control/MCP requests. Interactive dialogs keep
-    /// using `pick_open`, `pick_save` and `write` with the user's authority.
-    pub automation_read: Option<AutomationReadFn>,
-    pub automation_write: Option<AutomationWriteFn>,
-    pub automation_command: Option<AutomationCommandFn>,
-    /// Encode an RGBA8 image as PNG (used for screenshots and `ui.render`).
-    pub encode_png: Option<EncodePngFn>,
-    /// Open a URL in the system browser (native). Falls back to `ctx.open_url` (web) when unset.
-    pub open_url: Option<OpenUrlFn>,
-    /// Files delivered asynchronously (web file pickers, drag-and-drop): drained every frame.
-    pub inbox: Option<Inbox>,
-    /// OS clipboard images: copies go out, screenshots and images from other apps come in.
-    pub clipboard_set_image: Option<ClipboardSetFn>,
-    pub clipboard_get_image: Option<ClipboardGetFn>,
-    /// Preferences persistence: the platform config directory on native, browser storage on
-    /// the web (see `prefs_ui`).
-    pub load_prefs: Option<LoadTextFn>,
-    pub save_prefs: Option<SaveTextFn>,
-    /// Crash-recovery autosave (Preferences › File Handling) and recovery at launch.
-    pub autosave: Option<AutosaveFn>,
-    pub discard_autosave: Option<DiscardAutosaveFn>,
-    pub recover: Option<RecoverFn>,
-    /// History Log text file output.
-    pub append_text: Option<AppendTextFn>,
-    /// OS requests (macOS open-documents / quit Apple events), polled every frame.
-    pub os_events: Option<OsEventsFn>,
-    /// The persistent brush preset store, loading in the background (desktop; see
-    /// `photocraft_engine::preset_store`). Attached to the session once it arrives; without
-    /// one, brush presets are session-only (web, tests).
-    pub preset_store: Option<std::sync::mpsc::Receiver<photocraft_engine::preset_store::Opened>>,
-}
+/// The Info panel's cached sample: pixel x, y, document revision, Eyedropper Sample Size and the view zoom's bits.
+type InfoSampleKey = (i32, i32, u64, u32, u32);
 
 pub struct PhotocraftApp {
     pub session: Session,
     pub ui: UiState,
     pub services: Services,
-    canvases: HashMap<DocId, canvas::CanvasCache>,
-    checker: Option<egui::TextureHandle>,
-    drag: Option<canvas::Drag>,
+    /// Canvas caches per (document, display): CPU textures hold monitor values; the GPU
+    /// canvas state is shared (`canvas::GPU_OUTPUT`).
+    canvases: HashMap<(DocId, u32), canvas::CanvasCache>,
+    /// The revisions each document's canvas raster sources handed out per display (`canvas::PhotoComposite`, `canvas::ChannelOverlay`).
+    raster_logs: HashMap<(DocId, u32), canvas::SourceLogs>,
+    /// Navigator textures belong to open documents, not the lifetime of the egui context.
+    navigator_textures: HashMap<DocId, canvas::NavigatorCache>,
+    /// `canvas::display_doc`'s live-adjust and Duotone documents per document: (snapshot,
+    /// preview key, the document shown).
+    display_memo: HashMap<DocId, (std::sync::Weak<Document>, u64, std::sync::Arc<Document>)>,
+    /// The main canvas's last GPU view of each document while it shows the plain document on
+    /// the GPU canvas: the Navigator draws the same texture at its own size (#4518).
+    navigator_gpu: HashMap<DocId, crate::gpu_canvas::ViewParams>,
+    /// Documents whose GPU canvas texture holds the plain document (`canvas::ensure_gpu`).
+    navigator_plain: std::collections::HashSet<DocId>,
+    /// Viewport pages of documents too large for their GPU texture set (`canvas::viewport_pages`).
+    streams: HashMap<DocId, canvas::viewport_pages::Stream>,
+    /// The Info panel's Color Sampler readouts for (document, revision) (`panels::sampler_readouts`).
+    info_samplers: Option<panels::SamplerReadouts>,
+    /// Display profile readings (#569).
+    monitors: monitor_status::State,
+    pub(crate) thumbnail_cache: std::sync::Arc<std::sync::Mutex<crate::home_recent_ui::ThumbnailCache>>,
+    /// The canvas tools' own state: every tool family's gesture, hover and option state
+    /// (`canvas::tools`).
+    pub(crate) canvas_tools: canvas::tools::CanvasTools,
     /// Brush/Eraser stroke being drawn, rendered by the engine (see `canvas::LiveStroke`).
     live_stroke: Option<canvas::LiveStroke>,
+    /// A live stroke just committed with its own pixels: the canvas caches that showed it
+    /// refresh only what it drew after the step they showed (`canvas::damage_since`).
+    committed_stroke: Option<canvas::CommittedStroke>,
+    /// Whether the last retouching stroke's commit took the pixels its live stroke drew
+    /// (`"fromLive"`) instead of rendering the stroke again (`retouch_ui::finish_stroke`).
+    pub(crate) retouch_from_live: bool,
     /// Footprint trail of a retouching drag (see `stroke_trail`).
     trail: Option<stroke_trail::Trail>,
+    /// Remove tool strokes waiting to be applied together (Remove after each stroke off), the
+    /// document, layer and channel they belong to, and their tint on the canvas (`retouch_ui`).
+    /// Each as a `paint.remove` `strokes` entry: its points and the size, hardness and spacing it
+    /// was drawn with, which its tint shows and its removal uses.
+    pub(crate) remove_pending: Vec<serde_json::Value>,
+    pub(crate) remove_pending_target: Option<retouch_ui::RemoveTarget>,
+    pub(crate) remove_trail: Option<stroke_trail::Trail>,
+    /// The numbers that keep apart the textures the app makes for its canvas previews (transform previews, stroke
+    /// trails, Object Finder masks): a preview made again under the same name gets a number no earlier one had, so
+    /// the texture store never shows the old picture for it. One counter for the whole app, since previews of a
+    /// name are made in several places (a transform begins in one, re-renders in another).
+    pub(crate) texture_serials: craft::ui::primitives::Serials,
+    /// The menu bar's rows and the English text of its titles, rebuilt when their inputs change
+    /// (`menus::MenuModel`).
+    pub(crate) menu_model: Option<menus::MenuModel>,
+    /// The toolbar's slots for the stored layout (`tool_commands::ToolbarSlots`).
+    pub(crate) toolbar_slots: panels::tool_commands::ToolbarSlots,
+    /// The dock's spec model and kept panels (`panel_docking::DockModel`).
+    pub(crate) dock_model: panels::panel_docking::DockModel,
+    /// The patterns and styles the preset views draw from, held while unchanged (`preset_browser::PresetArt`).
+    pub(crate) preset_art: panels::preset_browser::PresetArt,
     /// Move tool drag shown live (`move_ui`).
     pub(crate) move_preview: Option<move_ui::MovePreview>,
-    /// The next tool `Down` is a right-button drag that erases (see `paint_mouse`).
-    secondary_erase: bool,
-    /// End of the last painting stroke: ⇧-click draws a straight line from it (#178).
-    last_stroke_end: Option<(DocId, [f64; 2])>,
+    /// Move tool › Show Highlight on Rollover: the last hover answer (`move_hover`).
+    pub(crate) move_hover: Option<move_hover::Hover>,
+    /// Smart Guides distances shown with ⌘ held over the canvas: the last answer (`move_distance`).
+    pub(crate) move_distance: Option<move_distance::Cache>,
+    /// Object Selection › Object Finder: the hover preview (`object_finder`).
+    pub(crate) object_finder: Option<object_finder::Finder>,
+    /// A blend mode hovered in the Layers panel, shown live (`blend_preview`).
+    pub(crate) blend_preview: Option<blend_preview::BlendPreview>,
+    /// Layers panel drag: temporary reordered document displayed until mouse release.
+    pub(crate) reorder_preview: Option<layers_panel_ui::ReorderPreview>,
+    /// Whether the currently dragged layer is over a valid destination this frame.
+    pub(crate) reorder_preview_hit: bool,
+    /// Patch Tool drag: the healed document at the pointer (`patch_preview`).
+    pub(crate) patch_preview: Option<patch_preview::PatchPreview>,
+    /// Content-Aware Move drag or box shown with its result (`cam_preview`).
+    pub(crate) cam_preview: Option<cam_preview::CamPreview>,
+    /// Image › Apply Data Set…'s Preview: the set shown in the document (`apply_data_set_ui`).
+    pub(crate) data_set_preview: panels::apply_data_set_ui::PreviewState,
+    /// The Brush or Pencil erase key is held this frame (`hold_keys::erase_held`, #3439).
+    held_erase: bool,
+    /// Position and pen pressure at the last stroke's endpoint: ⇧-click interpolates from them (#178, #2827).
+    last_stroke_end: Option<(DocId, [f64; 3])>,
     /// Control+Alt-drag brush resize in progress (`brush_resize`, #231).
-    pub(crate) brush_resize: Option<brush_resize::Resize>,
-    control_rx: Option<Receiver<ControlRequest>>,
-    pending_screenshots: Vec<(u64, Option<String>, Sender<ControlResponse>)>,
-    /// Screenshots not yet requested from the viewport: (token, earliest time in ms, frames seen).
-    queued_screenshots: Vec<(u64, f64, u32)>,
-    /// Control replies waiting for queued synthetic input to be processed.
-    input_waiters: Vec<Sender<ControlResponse>>,
+    pub(crate) brush_resize: brush_resize::PaintResize,
+    /// The layer a canvas click picked the Move tool way (its Auto-Select, or a ⌘-click from another
+    /// tool) and the engine's active-layer change count right after that pick
+    /// (`Session::active_layer_changes`). The Layers panel's reveal reads it when it next draws, and
+    /// accepts it only if nothing changed the active layer since, however long ago (`layer_reveal`, #11381).
+    pub(crate) move_pick: Option<(photocraft_doc::LayerId, u64)>,
+    /// Caps Lock toggled on, read from the OS each frame (`services.caps_lock`): painting tools
+    /// show the precise crosshair whatever the cursor preference (#1758).
+    pub caps_lock: bool,
+    /// The first digit of a two-digit opacity typed on the number keys (`opacity_keys`, #352).
+    pub(crate) opacity_keys: craft::behavior::DigitKeys,
+    /// The control channel: requests from a transport, the replies waiting on input, jobs and
+    /// screenshots, and the screenshot queue (`app/control.rs`).
+    #[cfg(not(target_arch = "wasm32"))]
+    control: Option<craft::automation::ControlChannel>,
     /// Live (uncommitted) adjustment edit shown on canvas while a slider is dragged.
     pub live_adjust: Option<(photocraft_doc::LayerId, Value)>,
     /// Frames rendered (for tests and the status bar).
     pub frame: u64,
-    /// Apply theme on first frame.
-    styled: bool,
-    /// Whether the window uses an integrated (transparent) macOS title bar.
-    pub integrated_titlebar: bool,
-    fonts_ready: bool,
+    /// What the notice stack keeps between frames: the pointer rest that gives a fresh auto-hide
+    /// delay in the frame the pointer leaves (`notices::show`).
+    pub(crate) notices_live: notices::Live,
+    /// The low-memory warning's schedule and state (`memory_warning`).
+    pub(crate) low_memory: memory_warning::Watch,
     /// Screen rect of the main canvas last frame (for overlays and the navigator).
     pub last_canvas_rect: egui::Rect,
+    /// The egui layer the main canvas was drawn on last frame: preset drops target it.
+    pub last_canvas_layer: egui::LayerId,
+    /// Physical pixels per egui point of the canvas last frame (`ctx.pixels_per_point`, which
+    /// folds in both the display scale and Interface › UI Scale). The canvas maps document pixels
+    /// to physical pixels, so point-space geometry divides the view zoom by this (see
+    /// [`Self::point_zoom`]).
+    pub ppp: f32,
+    /// The document area showing the active document's canvas last frame (not the tabs, the
+    /// start screen or an opening file's card): files dropped here are placed as layers.
+    pub(crate) drop_canvas_rect: Option<egui::Rect>,
+    /// Where a floating document window's title bar dropped docks its document, in the main window's points, as of
+    /// the last frame: the document tab strip, or a band of its height at the top of the document area (#16415).
+    pub(crate) dock_drop_rect: Option<egui::Rect>,
+    /// The window's one egui context, for code without one in hand: SAVED-tier reads and writes,
+    /// the Frame tool's transforms from pointer events, and the mapping and panels that read the
+    /// canvas's zoom ease (`document_display::shown_camera`). Read it through [`Self::ctx`].
+    ctx: egui::Context,
+    pub(crate) frame_preview: Option<frame_tool::Preview>,
+    /// Files dropped on the canvas still to place, one Free Transform at a time, each with the
+    /// document it was dropped on.
+    pub(crate) drop_places: std::collections::VecDeque<(DocId, file_open::DropPlace)>,
+    /// The document each of `ui.views` belongs to, as of the last [`Self::sync_views`].
+    view_docs: Vec<DocId>,
+    /// The document `ui.selected_path` belongs to, as of the last [`Self::sync_views`]: a Paths
+    /// panel selection never carries over to a same-named path in another tab.
+    path_document: Option<(DocId, u64, std::sync::Weak<Document>)>,
     pub fps: f32,
-    last_frame_time: f64,
-    thumbs: HashMap<(photocraft_doc::LayerId, u8), (u64, egui::TextureHandle)>,
-    /// Snapshots whose live layer/mask keys were last used to prune thumbnail handles.
-    thumb_documents: Vec<(DocId, std::sync::Weak<Document>)>,
+    pub(crate) last_frame_time: f64,
     /// Content bounds cached per (key, revision): scanning a 36 MP layer every frame cost ~77 ms.
     bounds_cache: HashMap<u64, (u64, photocraft_geom::Rect)>,
     /// Downsampled proxy of the active document for live previews: (doc, revision, k, proxy).
     pub(crate) proxy: Option<(DocId, u64, u32, std::sync::Arc<Document>)>,
     /// Key of the preview currently uploaded to the GPU (doc, params hash).
     pub(crate) proxy_uploaded: Option<(DocId, u64)>,
-    /// Selection outline cache: (doc, revision, segments).
     /// Live filter preview (proxy document with the filter applied).
+    pub(crate) guide_edit: Option<guide_edit::Draft>,
     pub(crate) filter_preview: Option<filter_dialog::FilterPreview>,
+    /// The live preview of the parameter dialogs' own filters, on the dialog lane.
+    pub(crate) filter_live: craft::imaging::ui::LivePreview,
+    /// The Image › Adjustments dialog that is open: its layer and values (`adjust_dialog`).
+    pub(crate) adjust_open: Option<adjust_dialog::OpenAdjust>,
+    /// The Properties panel's adjustment edit in progress, with the tone editor's shown channel
+    /// (`adjust_editors::PropertiesAdjust`).
+    pub(crate) adjust_session: Option<adjust_editors::PropertiesAdjust>,
+    /// Twice the passes the Properties panel was not in front or ran without showing the Reset session's layer: the
+    /// session (`adjust_editors`) takes a layer's settings anew after the panel stopped showing it. A pass count would
+    /// also move while the panel replays its memoized body, which is still showing it.
+    pub(crate) properties_hidden: u64,
+    /// Whether the Properties panel's run showed the Reset session's layer (`properties_hidden`).
+    pub(crate) properties_tracked: bool,
+    /// The Color Picker dialog asking for a screen sample: the dialog and the field that took it.
+    pub(crate) dialog_dropper: Option<(craft::ui::dialog::DialogId, String)>,
+    /// The child dialog (colour picker or contour editor) the open Layer Style dialog has, with that dialog's id.
+    pub(crate) layer_style_child: Option<(craft::ui::dialog::DialogId, dialogs::layer_style::Child)>,
+    /// What each open Color Picker edits (`color_picker_ui`).
+    pub(crate) color_targets: HashMap<craft::ui::dialog::DialogId, color_picker_ui::PickTarget>,
+    /// Colours a Color Picker answered with OK, waiting for their owner: (dialog, field, colour).
+    pub(crate) color_answers: Vec<(craft::ui::dialog::DialogId, String, craft::theme::Srgba)>,
+    /// The screen-colour pick in progress (`screen_picker`).
+    pub(crate) screen_pick: craft::color_ui::ui::ScreenPick,
+    /// Select and Mask / Content-Aware Fill / Liquify / Gallery / Vanishing Point sessions.
+    pub(crate) caf: Option<caf_ui::CafApp>,
+    pub(crate) liquify: Option<liquify_ui::LiquifyApp>,
+    pub(crate) gallery: Option<gallery_ui::GalleryApp>,
+    pub(crate) vanishing: Option<vp_ui::VpApp>,
+    /// The Layer Style, Select and Mask and parameter dialogs' open targets, one field per family,
+    /// keyed by the dialog.
+    pub(crate) layer_style_target: Option<(craft::ui::dialog::DialogId, DocId, photocraft_doc::LayerId)>,
+    pub(crate) select_mask_target: Option<(craft::ui::dialog::DialogId, DocId, photocraft_doc::LayerId, std::sync::Arc<select_mask_ui::PcSelectMaskSource>)>,
+    /// The Guide Layout dialog's document.
+    pub(crate) guide_layout_doc: Option<(craft::ui::dialog::DialogId, DocId)>,
+    /// The Export As dialog that is open.
+    pub(crate) export_open: Option<export_dialog::ExportOpen>,
+    /// The layer the Layers panel reveals when it next draws, with the groups to open for it
+    /// (`layer_reveal::{mark, file}`).
+    pub(crate) pending_reveal: Option<(photocraft_doc::LayerId, craft::layers::ui::panel::Groups)>,
+    /// The Pattern Fill dialog's preview and open state (`pattern_fill_ui`).
+    pub(crate) pattern_fill: pattern_fill_ui::State,
+    #[cfg(not(target_arch = "wasm32"))]
+    filter_preview_worker: crate::dialogs::filter_preview_worker::Worker,
+    /// Full CPU canvas redraws running in the background, by document (#4024).
+    pub(crate) redraws: std::collections::HashMap<photocraft_doc::DocId, background_redraw::Redraw>,
+    /// The last finished background redraws, for going back to a state drawn a moment ago (#6528).
+    pub(crate) kept: background_redraw::KeptComposites,
     /// Select › Color Range dialog preview (proxy document + mask / image textures).
     pub(crate) color_range: Option<color_range_ui::Preview>,
     /// Image › Adjustments dialog preview through a temporary clipped adjustment layer.
     pub(crate) adjust_preview: Option<adjust_preview::AdjustPreview>,
-    /// Synthetic input events queued by automation (`ui.click`, `ui.key`, …), injected next frame.
-    pub(crate) synthetic: Vec<egui::Event>,
-    /// True only while a frame is processing synthetic automation input. It
-    /// makes shortcut- and dialog-triggered commands pass the same policy as
-    /// direct control calls.
+    /// The Properties panel's live adjustment-layer drag: its damage region and coverage
+    /// (`adjust_preview::live_key`).
+    pub(crate) live_adjust_preview: Option<adjust_preview::LiveAdjust>,
+    /// The Levels dialog's Alt-drag clipping display over the canvas.
+    pub(crate) levels_clipping: Option<levels_clipping::Cache>,
+    /// The active document injected input was queued for (`ui.click`, `ui.key`, …), while it is
+    /// queued: a switch of the active document withdraws it (`withdraw_stale_input`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) input_queued_for: Option<InputTarget>,
+    /// True only while a pass's input carries injected automation input
+    /// (`WindowHost::injected_pass`). It makes shortcut- and dialog-triggered commands pass the
+    /// same policy as direct control calls.
     pub(crate) automation_input: bool,
+    /// The direct control-command route keeps Actions playback synchronous and dialog-free.
+    pub(crate) programmatic_playback: bool,
+    /// How many `run_command` calls are on the stack. Only the outermost one writes the frame's
+    /// command stage: a nested run (`file.save` → `layer.smartObjects.saveContents`,
+    /// `actions.play` → its steps) is already inside the outer call's time.
+    run_depth: u32,
+    /// Action playbacks paused at a step dialog, by the token in that dialog's fields
+    /// ([`actions::RESUME`]): what to play next and the automation gate it paused under.
+    pub(crate) paused_playbacks: actions::PausedPlaybacks,
     /// Levels/Curves histogram cache: (document, adjustment layer, revision it is valid for).
     pub(crate) tone_hist: Option<(DocId, photocraft_doc::LayerId, u64, std::sync::Arc<tone::Histograms>)>,
-    /// Histogram panel cache: (document, revision, computed at ms, histograms).
-    pub(crate) doc_hist: Option<(DocId, u64, f64, std::sync::Arc<tone::Histograms>)>,
+    /// Histogram panel: the document's histogram (`histogram_panel`).
+    pub(crate) doc_hist: Option<histogram_panel::PanelHist>,
+    /// Histogram panel: the histogram of the adjustment previewing on the canvas.
+    pub(crate) doc_hist_preview: Option<histogram_panel::PanelHist>,
+    /// The panel histogram being computed on a worker thread.
+    pub(crate) hist_job: Option<histogram_panel::HistJob>,
+    /// The (document, revision) an Uncached Refresh asked to count at cache level 1.
+    pub(crate) hist_uncached: Option<(DocId, u64)>,
+    /// Memoized `tone::selection_key` of the active document's current revision
+    /// (`histogram_panel::update` refreshes it once per frame; the hash walks every tile of the
+    /// selection mask, while any change to the selection arrives as a new document revision).
+    pub(crate) hist_sel_key: Option<(DocId, u64, u64)>,
     /// Free Transform preview (document without the moving pixels + their texture).
-    pub(crate) transform_preview: Option<transform_tool::TransformPreview>,
+    pub(crate) transform_preview: Option<transform_tool::OpenPreview>,
+    /// The canvas area the last Free Transform box's preview changes (`transform_tool::damage`).
+    transform_area: Option<crate::transform_tool::OpenArea>,
+    /// A large layer's Free Transform box being prepared in the background.
+    transform_preparing: Option<crate::transform_tool::Preparing>,
     /// Move-tool ⇧/⌥ drag state (move_mods).
     pub(crate) move_mods: move_mods::MoveDrag,
-    /// Live Layer Style dialog preview: (key over revision + style fields, document with the style applied).
-    pub(crate) style_preview: Option<(u64, Option<std::sync::Arc<Document>>)>,
+    /// Cached document for a modal text Style Options color preview.
+    pub(crate) text_style_preview: Option<type_panels_ui::color_picker::Preview>,
+    /// The run of arrow-key nudges that share one History state (nudge_bundle).
+    pub(crate) nudge_bundle: nudge_bundle::NudgeBundle,
+    /// Live Layer Style dialog preview: (key over revision + style fields, preview or validation error).
+    pub(crate) style_preview: Option<(u64, Result<std::sync::Arc<Document>, String>)>,
+    pub(crate) solid_fill_preview: Option<solid_fill_ui::Preview>,
+    /// Shape fill Color Picker preview (shape_fill_ui).
+    pub(crate) shape_fill_preview: Option<shape_fill_ui::Preview>,
     /// Liquify dialog, Puppet Warp and Perspective Warp sessions (distort_ui).
     pub(crate) distort: distort_ui::Distort,
     /// Gradient tool live-mode drags and previews (gradient_ui).
     pub(crate) gradient: gradient_ui::LiveGradient,
-    /// Filter › Camera Raw Filter dialog (camera_raw_ui).
-    pub(crate) camera_raw: Option<camera_raw_ui::CameraRawDialog>,
+    /// The Camera Raw session that is open: the open-time dialog or the Filter (`camera_raw_ui`).
+    pub(crate) raw: Option<crate::dialogs::camera_raw_ui::RawSession>,
+    /// The reply of the Camera Raw finish or cancel the result pump ran last, for the menu request that confirmed it:
+    /// the request clears it when it starts and takes it when it ends (`camera_raw_ui::menu`).
+    pub(crate) raw_reply: Option<Result<serde_json::Value, String>>,
+    /// Raws just opened interactively, waiting in the open-time Camera Raw dialog (shown on the
+    /// next frame, which has the egui context); several share it in a filmstrip.
+    pub(crate) raw_shelf: Vec<camera_raw_ui::HeldRaw>,
+    /// The open-time re-develops (or their Camera Raw steps) running in the background, one per
+    /// raw being opened.
+    pub(crate) raw_redevelop: Vec<camera_raw_ui::Redevelop>,
     /// Filter › Adaptive Wide Angle dialog (wide_angle_ui).
-    pub(crate) wide_angle: Option<wide_angle_ui::WideAngleDialog>,
-    /// Signature of the image we last put on the OS clipboard (to tell ours from other apps').
+    pub(crate) wide_angle: Option<wide_angle_ui::WideAngleApp>,
+    /// What each open Color Picker's live target was when it opened, to put back on Cancel
+    /// (`color_picker_ui::live_preview`).
+    pub(crate) color_picker_live: Vec<color_picker_ui::live_preview::Live>,
+    /// A command clicked while Free Transform commits in the background, run when it lands.
+    pub(crate) after_transform_commit: Option<(String, serde_json::Value)>,
+    /// Last mirrored or imported OS image; this can predate the current internal copy.
     os_clip_sig: Option<u64>,
+    /// Last observed SVG bytes, to distinguish an unchanged OS source from a newer internal copy.
+    os_clip_svg: Option<std::sync::Arc<Vec<u8>>>,
+    /// The session copy, if any, need not track the OS clipboard. An older OS signature is kept
+    /// to recognize unchanged system contents when exporting a newer copy failed or was disabled.
+    clip_unmirrored: bool,
     /// The session clipboard currently holds an image imported from the OS clipboard: it has no
     /// original position, so Paste centres it (see `menus` "edit.paste").
     pub(crate) clip_external: bool,
     /// The OS clipboard was already read for the paste in flight (Edit › Paste positions it first),
     /// so `run` doesn't read it a second time.
     pub(crate) clip_read_for_paste: bool,
+    pub(crate) smart_svg: smart_svg_ui::State,
     /// Pointer position over the canvas (document px), for the Info panel and status bar.
     pub(crate) hover_doc: Option<[f64; 2]>,
-    /// Info panel sample cache: ((x, y, revision), composite RGBA).
-    info_sample: Option<((i32, i32, u64), [f32; 4])>,
-    /// Guide being dragged (from a ruler or with the Move tool).
-    pub(crate) guide_drag: Option<rulers::GuideDrag>,
-    /// Crop tool gesture in progress (see `crop_ui`).
-    pub(crate) crop: crop_ui::CropState,
+    /// Layer hovered in the Layers panel, outlined on the canvas.
+    pub(crate) hover_layer: Option<photocraft_doc::LayerId>,
+    /// The commands run from any source (`menus::invoke`, the commands keys and surfaces fire, the control channel). Every
+    /// bar's and panel's version holds it (`panels::region_versions`): a command may change anything a slot shows.
+    pub(crate) commands_run: u64,
+    /// A layer whose row the Layers panel opens for renaming in its next pass (Layer › Rename
+    /// Layer, the row menu's Rename Layer…).
+    pub(crate) layers_rename: Option<photocraft_doc::LayerId>,
+    /// The Smart Filter row selected on its own, per document ([`crate::smart_ui::selected`]).
+    pub(crate) smart_filter_picks: crate::smart_ui::FilterPicks,
+    /// Select › Find Layers: the Layers panel's Name filter takes the focus in its next pass.
+    pub(crate) find_layers_focus: bool,
+    /// Layer hovered on the canvas, highlighted in the Layers panel.
+    pub(crate) canvas_hover_layer: Option<photocraft_doc::LayerId>,
+    pub(crate) clone_preview: Option<crate::canvas::ClonePreviewCache>,
+    /// Info panel sample cache: ((x, y, revision, Sample Size), composite RGBA).
+    info_sample: Option<(InfoSampleKey, [f32; 4])>,
+    /// Move tool marquee selecting layers (`move_box`).
+    pub(crate) layer_box: Option<move_box::LayerBox>,
+    /// Pen paths finished, which Undo back to their finish gives back to the Pen
+    /// (`vector_ui::pen_resume_on_undo`).
+    pub(crate) finished_pens: Vec<vector_ui::FinishedPen>,
     /// Type tool layout cache: ((doc, revision, layer), layout).
     pub(crate) type_layout: Option<((u64, u64, u64), std::sync::Arc<photocraft_text::TextLayout>)>,
-    /// Channel thumbnails for one document snapshot; view-only revisions reuse their pixels.
-    channel_thumbs: Option<(DocId, std::sync::Weak<Document>, Vec<egui::TextureHandle>)>,
-    /// Channels panel overlays / channel views drawn over the canvas, per document id.
-    pub(crate) channel_views: HashMap<u64, channel_view::Cache>,
-    /// Selection outline keyed by (document, mask identity × step × visible region).
-    pub(crate) outline_cache: Option<(DocId, u64, std::sync::Arc<Vec<outline::Segment>>)>,
+    /// The path a Type tool click on a path would place its text on, shown before the click
+    /// (`type_path_placement`).
+    pub(crate) type_path_preview: Option<type_path_placement::Preview>,
+    pub(crate) type_transform_preview: Option<type_transform::Preview>,
+    pub(crate) type_path_damage: Option<type_path_placement::Damage>,
+    /// A paragraph-box handle drag rendered in the background (`type_box_preview`).
+    pub(crate) type_box_preview: Option<type_box_preview::TypeBoxPreview>,
+    /// A font hovered in the Type tool's font picker, shown live (`type_font_preview`).
+    pub(crate) type_font_preview: Option<type_font_preview::TypeFontPreview>,
+    /// The colour under a text or gradient stop Color Picker, shown live before OK (`color_picker_preview`).
+    pub(crate) color_picker_preview: Option<color_picker_preview::Preview>,
+    /// The brush tip last drawn for the cursor, with the key it was built for (`brush_cursor`).
+    pub(crate) brush_tip: Option<(brush_cursor::TipKey, craft::ui::canvas_controls::brush::BrushTip)>,
+    /// Snap targets of the active document, derived data keyed on (document, revision,
+    /// `SnapOptions`, excluded layers); `snap_ui::snap` reads and refills it through `&self`.
+    pub(crate) snap_cache: std::sync::Mutex<Option<snap_ui::SnapCache>>,
+    /// What the chrome derives from each open document, kept per document revision (`app::doc_queries`).
+    pub(crate) doc_queries: app::doc_queries::DocQueries,
+    /// The saved workspaces and the one shown (`workspace_ui`).
+    pub workspaces: craft::ui::contract::Tracked<workspace_ui::Workspaces>,
+    /// Autosave timing and its retry state (`prefs_ui`).
+    pub(crate) autosave: craft::platform::autosave::Autosave,
     /// GPU canvas renderer, when running on the wgpu backend (see [`Self::set_wgpu`]). Dropped
     /// for the rest of the session when the device is lost (see `gpu_status`).
     gpu: Option<gpu_canvas::GpuCanvas>,
+    /// The device the window itself draws with, and its health flag: the GPU canvas's, or one
+    /// watched for the CPU canvas (see `gpu_status::check_window`).
+    window_device: Option<(eframe::wgpu::Device, photocraft_gpu::DeviceHealth)>,
+    /// That device was lost: frames draw nothing and the app closes once its work is saved (#3438).
+    window_lost: bool,
+    /// When (in `egui::InputState::time`) to try saving unsaved work for recovery again after a
+    /// failed attempt; the app closes only once it succeeded.
+    window_recovery_retry: Option<f64>,
+    /// The render state the GPU canvas was built on, kept after it is dropped so Retry GPU can
+    /// build a new one on the same device (see `gpu_status::choose_recovery`, #6577).
+    gpu_render_state: Option<eframe::egui_wgpu::RenderState>,
+    /// Why the GPU canvas was dropped (see `gpu_status::fall_back`).
+    gpu_fault: Option<photocraft_gpu::Fault>,
+    /// Out-of-memory errors this session after which the GPU canvas was rebuilt by itself (#6564).
+    gpu_oom_retries: u32,
     /// Run once the first frames have rendered (see [`Self::on_started`]).
     started: Option<gpu_status::StartedHook>,
     /// Frame and canvas-upload timings (exposed via `ui.inspect`).
     pub perf: gpu_canvas::Perf,
+    /// Per-frame stroke timings for latency reports (`PHOTOCRAFT_STROKE_TRACE`, see `stroke_trace`).
+    pub stroke_trace: stroke_trace::StrokeTrace,
+    /// Why each document's view is drawn on the CPU, and the history of changes (`render_path`).
+    pub render_path: render_path::RenderPath,
+    /// The last slow frames and their stages (`perf.slowFrames`, see `frame_stages`).
+    pub slow_frames: frame_stages::SlowFrames,
     /// Preferences, autosave and snapping runtime state (see `prefs_ui`, `snap_ui`).
     pub(crate) prefs_rt: prefs_ui::Runtime,
+    pub(crate) updates_rt: updates_ui::Runtime,
     /// Close, Revert or Exit parked behind the unsaved-changes prompt (see `discard_ui`).
     pub(crate) discard: Option<discard_ui::Prompt>,
+    /// A save parked behind a format's options prompt (TIFF, Targa, JPEG, DDS), run when the
+    /// prompt closes (`format_prompts`).
+    pub(crate) parked_save: Option<format_prompts::ParkedSave>,
+    /// Where each document was last saved or exported to through a dialog (#1826): its next Save
+    /// As or export dialog starts there rather than beside the document. Session-only.
+    pub(crate) save_dirs: HashMap<photocraft_doc::DocId, std::path::PathBuf>,
+    /// Each document's own file as it was when the document was opened from it or saved to it
+    /// (see [`FileStamp`]).
+    pub(crate) disk_stamps: HashMap<photocraft_doc::DocId, (String, FileStamp)>,
+    /// Files read but not opened yet: the first waits on its profile prompt, the rest behind it
+    /// (see `open_prompt`).
+    pub(crate) held_opens: std::collections::VecDeque<open_prompt::Held>,
+    /// PSD files whose memory preflight requires user approval before pixel decoding (see `open_prompt`).
+    pub(crate) held_memory_prompts: std::collections::VecDeque<open_prompt::MemoryPrompt>,
+    pub(crate) prompt_order: std::collections::VecDeque<open_prompt::PromptKind>,
+    pub(crate) held_record_again: Option<actions::record_again::Held>,
+    pub(crate) held_insert_menu: Option<actions::menu_item::Held>,
     /// Set once the user has agreed to quit, so the resulting close request goes through.
     pub(crate) allow_close: bool,
+    /// The craft framework's host and the framework dialogs open in it (`app/framework.rs`).
+    pub(crate) framework: app::framework::Framework,
+    /// The file dialog in progress (see `file_dialog`).
+    pub(crate) file_dialog: Option<file_dialog::Pending>,
+    /// What the last TIFF Options answer chose; it outlives a prompt.
+    pub(crate) tiff_remembered: tiff_options_ui::Remembered,
     /// Pen pressure/tilt from the platform (see `stylus`).
     pub stylus: stylus::Stylus,
+    /// Run long commands and file opens as background jobs with progress and Cancel (#210; see
+    /// `jobs_ui`). The desktop app turns it on; off (the default), everything runs inline as
+    /// before, which tests and scripts rely on.
+    pub background_jobs: bool,
+    /// Shortest time between frames (ms), or `None` for no cap. A present mode that doesn't wait
+    /// for the display (Low-Latency Drawing) would otherwise redraw as fast as it can while
+    /// anything keeps requesting repaints (a drag hovering, autoscroll, Liquify held still).
+    /// After #4472 (astigmata).
+    pub min_frame_ms: Option<f64>,
+    last_frame_start_ms: f64,
+    /// Background job bookkeeping: opening tabs, control replies waiting on a job.
+    pub jobs: jobs_ui::JobsUi,
     #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
     live_tokens: theme::live::LiveTokens,
 }
 
-impl PhotocraftApp {
-    pub fn new(session: Session, services: Services) -> Self {
-        let mut app = Self {
-            session,
-            ui: UiState::default(),
-            services,
-            canvases: HashMap::new(),
-            checker: None,
-            drag: None,
-            live_stroke: None,
-            trail: None,
-            move_preview: None,
-            secondary_erase: false,
-            last_stroke_end: None,
-            brush_resize: None,
-            control_rx: None,
-            pending_screenshots: Vec::new(),
-            queued_screenshots: Vec::new(),
-            input_waiters: Vec::new(),
-            live_adjust: None,
-            frame: 0,
-            styled: false,
-            integrated_titlebar: false,
-            fonts_ready: false,
-            last_canvas_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
-            fps: 0.0,
-            last_frame_time: 0.0,
-            thumbs: HashMap::new(),
-            thumb_documents: Vec::new(),
-            bounds_cache: HashMap::new(),
-            proxy: None,
-            proxy_uploaded: None,
-            outline_cache: None,
-            filter_preview: None,
-            color_range: None,
-            adjust_preview: None,
-            synthetic: Vec::new(),
-            automation_input: false,
-            channel_thumbs: None,
-            channel_views: HashMap::new(),
-            type_layout: None,
-            guide_drag: None,
-            crop: Default::default(),
-            hover_doc: None,
-            info_sample: None,
-            os_clip_sig: None,
-            clip_external: false,
-            clip_read_for_paste: false,
-            transform_preview: None,
-            move_mods: Default::default(),
-            style_preview: None,
-            distort: Default::default(),
-            gradient: Default::default(),
-            camera_raw: None,
-            wide_angle: None,
-            tone_hist: None,
-            doc_hist: None,
-            gpu: None,
-            started: None,
-            perf: Default::default(),
-            prefs_rt: Default::default(),
-            discard: None,
-            allow_close: false,
-            stylus: Default::default(),
-            #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-            live_tokens: theme::live::LiveTokens::from_env(),
-        };
-        // Saved preferences (and recovered documents) are in place before the first frame.
-        prefs_ui::load(&mut app);
-        // File › Scripts › Script Events Manager: "Start Application".
-        photocraft_engine::automate_cmds::fire_event(&mut app.session, "startApplication");
-        app
-    }
-
-    /// Draw the document canvas on the GPU (custom WGSL shader) instead of via egui textures.
-    /// Call from the app creator with `cc.wgpu_render_state`; without it the CPU path is used.
-    pub fn set_wgpu(&mut self, rs: eframe::egui_wgpu::RenderState) {
-        // Preferences › Performance › cache tile size (PHOTOCRAFT_GPU_TILE still overrides).
-        let tile = self.session.prefs().performance.cache_tile_size;
-        let gpu = gpu_canvas::GpuCanvas::with_tile(&rs, Some(tile));
-        self.perf.gpu_info.set_adapter(&gpu.adapter_info());
-        self.perf.gpu_info.canvas = "gpu".into();
-        self.gpu = Some(gpu);
-        self.prefs_rt.gpu_style = None;
-    }
-
-    /// Whether the document canvas currently draws on the GPU (false on the CPU path, and after
-    /// the device was lost).
-    pub fn gpu_active(&self) -> bool {
-        self.gpu.is_some()
-    }
-
-    /// The GPU canvas's device health flag (tests inject faults through it).
-    pub fn gpu_health(&self) -> Option<photocraft_gpu::DeviceHealth> {
-        self.gpu.as_ref().map(|g| g.health().clone())
-    }
-
-    /// Run `hook` once the app has rendered its first frames (and a document opened at launch
-    /// has drawn): the desktop app clears its crash-safe GPU startup marker there.
-    pub fn on_started(&mut self, hook: impl FnOnce(&mut PhotocraftApp) + 'static) {
-        self.started = Some(Box::new(hook));
-    }
-
-    /// Per-frame GPU health check (called from `logic`; tests call it directly): falls back to
-    /// the CPU canvas after a device loss and runs the started hook.
-    pub fn check_gpu(&mut self, ctx: &egui::Context) {
-        gpu_status::check(self, ctx);
-    }
-
-    /// Attach a control channel (requests arrive from a transport thread: TCP, stdin, tests).
-    pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
-        self.control_rx = Some(rx);
-        self
-    }
-
-    /// Run an engine command, reporting errors in the status bar.
-    pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-        let clip_read = std::mem::take(&mut self.clip_read_for_paste);
-        if self.automation_input
-            && let Some(authorize) = self.services.automation_command.as_ref()
-        {
-            authorize(id, &params)?;
-        }
-        let suppress_events = self.automation_input && self.session.prefs().script_events.enabled;
-        if suppress_events {
-            self.session.edit_prefs(|prefs| prefs.script_events.enabled = false);
-        }
-        let t0 = gpu_canvas::now_ms();
-        // The OS clipboard is read only on an explicit paste, never in the background (privacy, CPU).
-        if matches!(id, "edit.paste" | "edit.pasteSpecial.pasteInPlace") {
-            if !clip_read {
-                self.import_os_clipboard();
-            }
-            if self.session.clipboard.is_none() && self.session.active().is_some() && self.services.clipboard_get_image.is_some() {
-                // Enabled on the strength of the OS clipboard, which held no image: a quiet no-op.
-                self.ui.status = "Nothing to paste: the clipboard holds no image".into();
-                self.ui.status_error = false;
-                return Ok(serde_json::json!({"pasted": false}));
-            }
-        }
-        let r = self.session.execute(id, params).map_err(|e| e.to_string());
-        if r.is_ok() && matches!(id, "edit.copy" | "edit.cut" | "edit.copyMerged") {
-            self.clip_external = false;
-            self.export_os_clipboard();
-        }
-        self.perf.last_command = id.to_string();
-        self.perf.command_ms = gpu_canvas::now_ms() - t0;
-        match &r {
-            Ok(_) => {
-                self.sync_views();
-                if self.ui.status_error {
-                    self.ui.status.clear();
-                    self.ui.status_error = false;
-                }
-            }
-            Err(e) => {
-                self.ui.status = e.clone();
-                self.ui.status_error = true;
-            }
-        }
-        if suppress_events {
-            self.session.edit_prefs(|prefs| prefs.script_events.enabled = true);
-        }
-        r
-    }
-
-    /// Keep one view per document.
-    pub fn sync_views(&mut self) {
-        let n = self.session.documents().len();
-        self.ui.views.resize_with(n, Default::default);
-        self.ui.windows.retain(|w| w.document < n);
-        self.prune_thumbs();
-        self.sync_mask_targets();
-        // Channel-view textures outlive a hidden view (cheap re-show), not their document.
-        if !self.channel_views.is_empty() {
-            let docs = self.session.documents();
-            self.channel_views.retain(|id, _| docs.iter().any(|d| d.doc.id.0 == *id));
-        }
-        // Commands may close and reopen a preserved-ID document before the next repaint.
-        canvas::retain_gpu_documents(self);
-    }
-
-    /// Record `path` as the most-recently-opened file (File › Open Recent): de-duplicated, newest
-    /// first, capped at Preferences › File Handling › Recent File List Contains. The list lives in
-    /// the preferences (`fileHandling.recentFiles`), so it survives a restart; `ui.recent_files`
-    /// mirrors it for the menus and the Home screen.
-    pub fn push_recent(&mut self, path: &str) {
-        let cap = self.recent_cap();
-        let mut r = self.session.prefs().file_handling.recent_files.clone();
-        r.retain(|p| p != path);
-        r.insert(0, path.to_string());
-        r.truncate(cap);
-        self.ui.recent_files = r.clone();
-        self.session.prefs.edit(|p| p.file_handling.recent_files = r);
-    }
-
-    /// File › Open Recent › Clear Recent File List.
-    pub fn clear_recent(&mut self) {
-        self.ui.recent_files.clear();
-        self.session.prefs.edit(|p| p.file_handling.recent_files.clear());
-    }
-
-    /// How many recent files to remember ("Recent File List Contains", 0–100).
-    pub fn recent_cap(&self) -> usize {
-        self.session.prefs().file_handling.recent_file_count.min(100) as usize
-    }
-
-    /// Mirror the stored recent-file list into the UI state (after loading the preferences, or
-    /// when the Preferences dialog or an agent changes the list or its length). Cheap enough to
-    /// run every frame: a slice comparison of at most 100 paths, no allocation unless it changed.
-    pub fn sync_recent(&mut self) {
-        let cap = self.recent_cap();
-        let stored = &self.session.prefs().file_handling.recent_files;
-        let want = stored.get(..cap.min(stored.len())).unwrap_or_default();
-        if self.ui.recent_files.as_slice() != want {
-            self.ui.recent_files = want.to_vec();
-        }
-    }
-
-    /// Open a file's bytes as a new document named `name`; returns the import warnings (also
-    /// shown to the user). Files from disk go through [`open_file`](Self::open_file), which also
-    /// remembers the path. Brush and gradient files go to the preset libraries instead.
-    pub fn open_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-        if let Some(r) = preset_files_ui::open(self, name, bytes) {
-            return r.map(|()| Vec::new());
-        }
-        let import = self.services.import.as_ref().ok_or("no importer configured")?;
-        let (doc, warnings) = import(name, bytes)?;
-        // Edit › Color Settings policies apply on open; mismatches can ask what to do.
-        // No path yet: a bare name isn't a location to save back to (`open_file` sets the path).
-        let (_, color) = self.session.open_document(doc, None);
-        self.sync_views();
-        self.ui.status = format!("Opened {name}");
-        self.ui.status_error = false;
-        notices::io_warnings(self, &format!("Opened {name}"), &warnings);
-        // Script events bound to "Open Document".
-        photocraft_engine::automate_cmds::document_opened(&mut self.session);
-        self.sync_views();
-        let ask = color.get("ask").and_then(Value::as_bool) == Some(true);
-        if ask && (color.get("mismatch").and_then(Value::as_bool) == Some(true) || color.get("missing").is_some()) {
-            prefs_ui::open_mismatch(self, &color);
-        }
-        Ok(warnings)
-    }
-
-    /// Open bytes supplied by an authenticated automation client without
-    /// invoking user-configured script-event paths outside the granted root.
-    /// Returns the import warnings (also shown to the user). Brush and gradient
-    /// files go to the preset libraries, as for interactive opens.
-    pub fn open_automation_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-        let events_enabled = self.session.prefs().script_events.enabled;
-        if events_enabled {
-            self.session.edit_prefs(|prefs| prefs.script_events.enabled = false);
-        }
-        let result = match preset_files_ui::open(self, name, bytes) {
-            Some(r) => r.map(|()| Vec::new()),
-            None => self.import_automation_document(name, bytes),
-        };
-        if events_enabled {
-            self.session.edit_prefs(|prefs| prefs.script_events.enabled = true);
-        }
-        result
-    }
-
-    /// The document half of [`open_automation_bytes`](Self::open_automation_bytes): no script
-    /// events and no Color Settings policy (which may read user-configured profile paths).
-    fn import_automation_document(&mut self, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-        let import = self.services.import.as_ref().ok_or("no importer configured")?;
-        let (doc, warnings) = import(name, bytes)?;
-        self.session.add_document(doc, Some(name.to_string()));
-        self.sync_views();
-        self.ui.status = format!("Opened {name}");
-        self.ui.status_error = false;
-        notices::io_warnings(self, &format!("Opened {name}"), &warnings);
-        Ok(warnings)
-    }
-
-    /// Run one engine command on behalf of automation while suppressing
-    /// user-configured script-event file reads. Interactive commands retain
-    /// their normal event behavior.
-    pub fn run_automation(&mut self, id: &str, params: Value) -> Result<Value, String> {
-        let events_enabled = self.session.prefs().script_events.enabled;
-        if events_enabled {
-            self.session.edit_prefs(|prefs| prefs.script_events.enabled = false);
-        }
-        let result = self.run(id, params);
-        if events_enabled {
-            self.session.edit_prefs(|prefs| prefs.script_events.enabled = true);
-        }
-        result
-    }
-
-    /// File › Open: the platform dialog returns the chosen file's path (native; the web delivers
-    /// picks through the inbox instead).
-    pub fn open_dialog_file(&mut self) {
-        let picked = self.services.pick_open.as_mut().and_then(|f| f());
-        if let Some((path, bytes)) = picked
-            && let Err(e) = self.open_file(&path, &bytes)
-        {
-            self.open_failed(&file_open::display_name(&path), &e);
-        }
-    }
-
-    /// Save the active document to `path` (or a path chosen in the save dialog); returns the path
-    /// and the export warnings (also shown to the user).
-    pub fn save_as(&mut self, path: Option<String>) -> Result<(String, Vec<String>), String> {
-        // Edit Contents documents save back into their smart object.
-        if path.is_none() && self.session.is_enabled("layer.smartObjects.saveContents") {
-            self.run("layer.smartObjects.saveContents", serde_json::json!({}))?;
-            return Ok(("smart object".into(), Vec::new()));
-        }
-        let st = self.session.active().ok_or("no document")?;
-        // Documents are named after their file ("cat.png"): suggest "cat.psd", not "cat.png.psd".
-        let suggested = st.path.clone().unwrap_or_else(|| format!("{}.psd", st.doc.name.rsplit_once('.').map_or(st.doc.name.as_str(), |(stem, _)| stem)));
-        let path = match path {
-            Some(p) => p,
-            None => self.services.pick_save.as_mut().and_then(|f| f(&suggested)).ok_or("cancelled")?,
-        };
-        let export = self.services.export.as_ref().ok_or("no exporter configured")?;
-        let (bytes, warnings) = export(&st.doc, &path, &ExportSettings::default())?;
-        let write = self.services.write.as_mut().ok_or("no writer configured")?;
-        write(&path, &bytes)?;
-        if let Some(st) = self.session.active_mut() {
-            st.path = Some(path.clone());
-            st.saved_revision = st.revision;
-        }
-        self.ui.status = format!("Saved {path}");
-        // "Save Document" script events and File › Generate › Image Assets.
-        if let Some(i) = self.session.active_index()
-            && let Some(r) = photocraft_engine::automate_cmds::document_saved(&mut self.session, i)
-        {
-            self.ui.status = format!("Saved {path}; {} image assets in {}", r["files"].as_array().map_or(0, Vec::len), r["dir"].as_str().unwrap_or(""));
-        }
-        self.ui.status_error = false;
-        notices::io_warnings(self, &format!("Saved {}", file_open::display_name(&path)), &warnings);
-        self.sync_views();
-        Ok((path, warnings))
-    }
-
-    /// Save through the control session's capability-scoped writer. No file
-    /// picker or ambient writer is reachable from this path. Returns the path
-    /// written and the export warnings (also shown to the user).
-    pub fn save_automation(&mut self, path: Option<String>) -> Result<(String, Vec<String>), String> {
-        let state = self.session.active().ok_or("no document")?;
-        let target = path.or_else(|| state.path.clone()).ok_or("document has no relative path; pass `path`")?;
-        let export = self.services.export.as_ref().ok_or("no exporter configured")?;
-        let (bytes, warnings) = export(&state.doc, &target, &ExportSettings::default())?;
-        let write = self.services.automation_write.as_mut().ok_or("automation write authority is not configured")?;
-        write(&target, &bytes)?;
-        if let Some(state) = self.session.active_mut() {
-            state.path = Some(target.clone());
-            state.saved_revision = state.revision;
-        }
-        self.ui.status = format!("Saved {target}");
-        self.ui.status_error = false;
-        notices::io_warnings(self, &format!("Saved {}", file_open::display_name(&target)), &warnings);
-        self.sync_views();
-        Ok((target, warnings))
-    }
-
-    fn drain_control(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.control_rx.take() else { return };
-        while let Ok(req) = rx.try_recv() {
-            let reply = req.reply.clone();
-            match control::handle(self, ctx, &req) {
-                control::Outcome::Done(v) => {
-                    let _ = reply.send(v);
-                }
-                control::Outcome::AfterInput => self.input_waiters.push(reply),
-                control::Outcome::Screenshot { token, path } => {
-                    // Wait out egui's fade animations (~83 ms) and a few rendered frames first.
-                    let settle = ctx.global_style().animation_time as f64 * 2000.0 + 60.0;
-                    self.queued_screenshots.push((token, gpu_canvas::now_ms() + settle, 0));
-                    self.pending_screenshots.push((token, path, reply));
-                }
-            }
-        }
-        self.control_rx = Some(rx);
-    }
-
-    fn issue_screenshots(&mut self, ctx: &egui::Context) {
-        let now = gpu_canvas::now_ms();
-        self.queued_screenshots.retain_mut(|(token, at, frames)| {
-            *frames += 1;
-            if now >= *at && *frames >= 3 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(*token)));
-                false
-            } else {
-                true
-            }
-        });
-    }
-
-    fn collect_screenshots(&mut self, ctx: &egui::Context) {
-        if self.pending_screenshots.is_empty() {
-            return;
-        }
-        let events: Vec<_> = ctx.input(|i| {
-            i.raw
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Screenshot { user_data, image, .. } => {
-                        let token = user_data.data.as_ref().and_then(|d| d.downcast_ref::<u64>()).copied()?;
-                        Some((token, image.clone()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        });
-        for (token, image) in events {
-            if let Some(i) = self.pending_screenshots.iter().position(|(t, _, _)| *t == token) {
-                let (_, path, reply) = self.pending_screenshots.remove(i);
-                let r = control::save_screenshot(self, &image, path.as_deref());
-                let _ = reply.send(r);
-            }
-        }
-    }
-}
-
-impl eframe::App for PhotocraftApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        i18n::set_current(i18n::Lang::from_pref(&self.session.prefs().interface.language));
-        if !self.styled {
-            Self::setup_context(ctx, self.ui.theme);
-            self.styled = true;
-        } else {
-            self.fonts_ready = true;
-        }
-        self.frame += 1;
-        let now = ctx.input(|i| i.time);
-        let dt = (now - self.last_frame_time) as f32;
-        if dt > 0.0 {
-            self.fps = self.fps * 0.9 + (1.0 / dt).min(240.0) * 0.1;
-        }
-        self.last_frame_time = now;
-        self.sync_views();
-        self.check_gpu(ctx);
-        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-        if self.live_tokens.poll(ctx, self.ui.theme) {
-            self.checker = None;
-        }
-        self.drain_control(ctx);
-        if self.ui.text_edit.is_some() && self.ui.tool != state::Tool::Type {
-            type_tool::commit(self);
-        }
-        if self.ui.pen.is_some() && self.ui.tool != state::Tool::Pen {
-            vector_ui::pen_commit(self, false);
-        }
-        // A transform whose layer or document went away (undo, close) ends silently.
-        if let Some(t) = &self.ui.transform
-            && self.session.active().and_then(|s| s.doc.layer(photocraft_doc::LayerId(t.layer))).is_none()
-        {
-            transform_tool::cancel(self);
-        }
-        self.collect_screenshots(ctx);
-        self.issue_screenshots(ctx);
-        prefs_ui::tick(self, ctx);
-        discard_ui::guard_window_close(self, ctx);
-        shortcuts::handle(self, ctx);
-        let arrived: Vec<(String, Vec<u8>)> =
-            self.services.inbox.as_ref().map(|q| std::mem::take(&mut *q.lock().unwrap_or_else(|e| e.into_inner()))).unwrap_or_default();
-        for (name, bytes) in arrived {
-            if let Err(e) = self.open_bytes(&name, &bytes) {
-                self.open_failed(&name, &e);
-            }
-        }
-        // Finder double-click / Open With / Dock drops (macOS open-documents events).
-        self.drain_os_events(ctx);
-        // Files dropped onto the window open as documents (with their path, like File › Open).
-        self.open_dropped(ctx.input(|i| i.raw.dropped_files.clone()));
-        // The control transport wakes the UI on arrival (ctx.request_repaint); only poll while a
-        // screenshot is pending. (Polling every 50 ms here made idle apps render at 20 fps.)
-        if !self.pending_screenshots.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
-    }
-
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        shortcuts::clipboard_keys(ctx, ctx.text_edit_focused() || self.ui.text_edit.is_some(), raw_input);
-        raw_input.events.extend(self.take_synthetic_step());
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        // Fonts registered via set_fonts only take effect next frame; named families would panic now.
-        if !self.fonts_ready {
-            ctx.request_repaint();
-            self.automation_input = false;
-            return;
-        }
-        let t0 = gpu_canvas::now_ms();
-        // View › Screen Mode › Full Screen Mode: only the image, on black (F or Esc returns).
-        let chrome = !self.ui.view.hides_chrome();
-        if !chrome && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            let _ = menus::invoke(self, &ctx, "view.screenMode.standard", serde_json::json!({}));
-        }
-        if chrome {
-            panels::title_bar(self, ui);
-        }
-        if chrome && self.ui.panels.options_bar {
-            panels::options_bar(self, ui);
-        }
-        if chrome && self.ui.panels.status_bar {
-            panels::status_bar(self, ui);
-        }
-        if chrome && self.ui.panels.toolbar {
-            panels::toolbar(self, ui);
-        }
-        if chrome {
-            panels::right_dock(self, ui);
-        }
-        let t = theme::Tokens::get(&ctx);
-        let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ui, |ui| {
-            canvas::document_area(self, ui);
-        });
-        panels::properties_window(self, &ctx);
-        brush_panel::window(self, &ctx);
-        preset_panels::windows(self, &ctx);
-        type_panels_ui::windows(self, &ctx);
-        analysis_ui::windows(self, &ctx);
-        timeline_ui::windows(self, &ctx);
-        workspace_ui::windows(self, &ctx);
-        palette::show(self, &ctx);
-        dialogs::show(self, &ctx);
-        discard_ui::show(self, &ctx);
-        distort_ui::show(self, &ctx);
-        camera_raw_ui::show(self, &ctx);
-        wide_angle_ui::show(self, &ctx);
-        canvas::extra_windows(self, &ctx);
-        notices::show(self, &ctx);
-        // A device lost while drawing this frame: switch to the CPU canvas before the next one.
-        gpu_status::check(self, &ctx);
-        self.automation_input = false;
-        self.perf.frame(gpu_canvas::now_ms() - t0);
-        // Synthetic input is injected one press/release step per frame: keep frames coming until
-        // the queue is empty, then release control replies waiting on it.
-        if !self.synthetic.is_empty() {
-            ctx.request_repaint();
-        } else if !self.input_waiters.is_empty() {
-            for w in self.input_waiters.drain(..) {
-                let _ = w.send(serde_json::json!({"ok": true, "result": null}));
-            }
-        }
-    }
-}
-
+/// The active document injected input was queued for.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_dropped(f: &(dyn egui::DroppedFile + Send + Sync)) -> Result<Vec<u8>, String> {
-    f.bytes()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputTarget {
+    /// The active document's generation: it changes on every switch of the active document, a
+    /// switch away and back included, and not on an edit, so an edit does not withdraw the input.
+    document: Option<u64>,
 }
 
-/// On the web, dropped-file bytes arrive asynchronously; the web shell handles drops itself.
-#[cfg(target_arch = "wasm32")]
-fn read_dropped(_f: &dyn egui::DroppedFile) -> Result<Vec<u8>, String> {
-    Err("drag-and-drop on the web is handled by the page; use File → Open".into())
-}
+#[cfg(test)]
+mod artboard_add_mode_tests;
+#[cfg(test)]
+mod background_eraser_tolerance_field_tests;
+#[cfg(test)]
+mod brush_picker_escape_tests;
+#[cfg(test)]
+mod cam_no_pixels_alert_tests;
+#[cfg(test)]
+mod eyedropper_context_menu_tests;
+#[cfg(test)]
+mod menu_automate_groups_tests;
+#[cfg(test)]
+mod patch_shift_constrain_tests;
+#[cfg(test)]
+mod paths_scroll_tests;
+#[cfg(test)]
+mod pencil_pressure_toggles_tests;
 
-impl PhotocraftApp {
-    /// Viewing a layer mask (#196) targets it; a vector-mask target needs a vector mask on the
-    /// active layer (a shape layer's path is its content, not a mask).
-    fn sync_mask_targets(&mut self) {
-        let Some(st) = self.session.active() else { return };
-        if photocraft_engine::mask_view_cmds::current(st).is_some() {
-            self.ui.mask_target = true;
-            self.ui.vector_mask_target = false;
+#[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
+mod stroke_frames_tests;
+
+#[cfg(test)]
+mod screenshot_tests;
+
+/// Helpers shared by the tests of more than one module.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use craft::settings::testing::MemoryFiles;
+    use craft::settings::{Location, OpenOptions, SettingsStore};
+
+    use crate::Services;
+
+    /// The folder of the scratch settings store; its file lives in `files`.
+    const DIR: &str = "/memory/photocraft";
+
+    /// Services whose preferences store reads and writes `files`, so a second app over the same files reads what the
+    /// first one stored. A zero debounce makes the first frame after a change write it.
+    pub(crate) fn services_over(files: &Arc<MemoryFiles>) -> Services {
+        let options = OpenOptions::new(Location::Dir(DIR.into())).debounce(Duration::ZERO).files(files.clone());
+        Services { settings: Some(SettingsStore::<photocraft_engine::prefs::SavedPrefs>::open_with(options)), ..Default::default() }
+    }
+
+    /// Makes the input a test hands `ctx` carry its modifiers as the window's does. egui reads the held modifiers only
+    /// from `Event::ModifiersChanged`; the window's integration announces each change before the press, key or wheel
+    /// that carries it, and stamps every event with the held set. A kittest event carries its modifiers on the event
+    /// alone, so this announces them where they differ from the held ones. It runs after the runtime's input hook and
+    /// sees the input egui will read, the runtime's injected events included.
+    pub(crate) fn announce_modifiers(ctx: &egui::Context) {
+        ctx.add_plugin(AnnouncedModifiers::default());
+    }
+
+    /// The modifiers each viewport's input has held so far.
+    #[derive(Default)]
+    struct AnnouncedModifiers(std::collections::HashMap<egui::ViewportId, egui::Modifiers>);
+
+    impl egui::Plugin for AnnouncedModifiers {
+        fn debug_name(&self) -> &'static str {
+            "photocraft.testing.announced_modifiers"
         }
-        if self.ui.vector_mask_target && !mask_thumbs_ui::has_vector_mask(st) {
-            self.ui.vector_mask_target = false;
-        }
-    }
 
-    fn prune_thumbs(&mut self) {
-        let documents = self.session.documents();
-        if self.thumb_documents.len() == documents.len()
-            && self.thumb_documents.iter().zip(documents).all(|((id, snapshot), st)| *id == st.doc.id && snapshot.ptr_eq(&std::sync::Arc::downgrade(&st.doc)))
-        {
-            return;
-        }
-        // Check snapshots every sync, but walk the layer tree only after it changes. A Weak
-        // tracks replacement (including undo and preserved-ID reopen) without retaining pixels.
-        if !self.thumbs.is_empty() {
-            let mut live = std::collections::HashSet::new();
-            let mut pending: Vec<_> = documents.iter().flat_map(|st| &st.doc.layers).collect();
-            while let Some(layer) = pending.pop() {
-                live.insert((layer.id, mask_thumbs_ui::THUMB_LAYER));
-                if layer.mask.is_some() {
-                    live.insert((layer.id, mask_thumbs_ui::THUMB_MASK));
-                }
-                if layer.vector_mask.is_some() {
-                    live.insert((layer.id, mask_thumbs_ui::THUMB_VECTOR));
-                }
-                if let Some(children) = layer.children() {
-                    pending.extend(children);
-                }
-            }
-            // Native files can restore IDs: retain the union across all open documents, rather
-            // than deleting an ID just because one document containing it was closed.
-            self.thumbs.retain(|key, _| live.contains(key));
-        }
-        self.thumb_documents = documents.iter().map(|st| (st.doc.id, std::sync::Arc::downgrade(&st.doc))).collect();
-    }
-
-    pub fn set_theme(&mut self, ctx: &egui::Context, kind: theme::ThemeKind) {
-        self.ui.theme = kind;
-        theme::apply(ctx, kind);
-        self.checker = None;
-    }
-
-    /// Cached 64px thumbnail of a pixel-ish layer, laid out in document space.
-    pub fn layer_thumb(&mut self, ctx: &egui::Context, doc: &Document, layer: &photocraft_doc::Layer) -> egui::TextureId {
-        // Key by content, not document revision: COW tiles change pointer only when their pixels
-        // change, so unrelated edits (e.g. painting another layer) don't rebuild this thumbnail.
-        let rev = layer.surface().map_or(0, surface_fingerprint) ^ (doc.size.width as u64) << 40;
-        let key = (layer.id, mask_thumbs_ui::THUMB_LAYER);
-        if let Some((r, tex)) = self.thumbs.get(&key)
-            && *r == rev
-        {
-            return tex.id();
-        }
-        let mut px = [0.0f32; 8];
-        let img = thumb_image(doc, 64, |x, y| {
-            let Some(s) = layer.surface() else { return [0.0; 4] };
-            let n = s.channels();
-            s.read_pixel(x, y, &mut px[..n]);
-            photocraft_raster::to_rgba(&s.format(), &px[..n])
-        });
-        self.store_thumb(ctx, key, rev, img)
-    }
-
-    pub fn mask_thumb(&mut self, ctx: &egui::Context, doc: &Document, id: photocraft_doc::LayerId, mask: &photocraft_doc::LayerMask) -> egui::TextureId {
-        let rev = surface_fingerprint(&mask.surface) ^ (doc.size.width as u64) << 40;
-        let key = (id, mask_thumbs_ui::THUMB_MASK);
-        if let Some((r, tex)) = self.thumbs.get(&key)
-            && *r == rev
-        {
-            return tex.id();
-        }
-        let mut v = [0.0f32; 1];
-        let img = thumb_image(doc, 64, |x, y| {
-            mask.surface.read_pixel(x, y, &mut v);
-            [v[0], v[0], v[0], 1.0]
-        });
-        self.store_thumb(ctx, key, rev, img)
-    }
-
-    fn store_thumb(&mut self, ctx: &egui::Context, key: (photocraft_doc::LayerId, u8), rev: u64, img: egui::ColorImage) -> egui::TextureId {
-        match self.thumbs.get_mut(&key) {
-            Some((r, tex)) => {
-                tex.set(img, egui::TextureOptions::LINEAR);
-                *r = rev;
-                tex.id()
-            }
-            None => {
-                let tex = ctx.load_texture(format!("thumb-{}-{}", key.0.0, key.1), img, egui::TextureOptions::LINEAR);
-                let id = tex.id();
-                self.thumbs.insert(key, (rev, tex));
-                id
-            }
-        }
-    }
-}
-
-/// Cheap identity of a surface's pixels: tile coordinates and `Arc` pointers.
-pub fn surface_fingerprint(s: &photocraft_raster::Surface) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ s.tile_count() as u64;
-    for (c, t) in s.tiles() {
-        let p = std::sync::Arc::as_ptr(t) as usize as u64;
-        h = (h ^ p ^ ((c.tx as u64) << 32 | c.ty as u32 as u64)).wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-/// Square thumbnail of the canvas area, letterboxed, sampling `f(x, y)` in document space.
-fn thumb_image(doc: &Document, side: usize, mut f: impl FnMut(i32, i32) -> [f32; 4]) -> egui::ColorImage {
-    let (w, h) = (doc.size.width.max(1) as f32, doc.size.height.max(1) as f32);
-    let scale = w.max(h) / side as f32;
-    let (ox, oy) = ((side as f32 - w / scale) / 2.0, (side as f32 - h / scale) / 2.0);
-    let mut px = vec![egui::Color32::TRANSPARENT; side * side];
-    for ty in 0..side {
-        for tx in 0..side {
-            let dx = (tx as f32 - ox + 0.5) * scale;
-            let dy = (ty as f32 - oy + 0.5) * scale;
-            if dx < 0.0 || dy < 0.0 || dx >= w || dy >= h {
-                continue;
-            }
-            let c = f(dx as i32, dy as i32);
-            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            px[ty * side + tx] = egui::Color32::from_rgba_unmultiplied(q(c[0]), q(c[1]), q(c[2]), q(c[3]));
-        }
-    }
-    egui::ColorImage::new([side, side], px)
-}
-
-impl PhotocraftApp {
-    /// Next step of queued synthetic input (automation): events up to and including the first
-    /// release, so egui sees press and release in separate frames. Hosts that don't call
-    /// `raw_input_hook` (offscreen harnesses) feed these to their input themselves.
-    pub fn take_synthetic_step(&mut self) -> Vec<egui::Event> {
-        let n = self
-            .synthetic
-            .iter()
-            .position(|e| matches!(e, egui::Event::PointerButton { pressed: false, .. } | egui::Event::Key { pressed: false, .. }))
-            .map_or(self.synthetic.len(), |i| i + 1);
-        let events: Vec<_> = self.synthetic.drain(..n).collect();
-        if !events.is_empty() {
-            self.automation_input = true;
-        }
-        events
-    }
-
-    /// Install fonts, image loaders and the theme. Call from the app creator when possible so the
-    /// very first frame renders; otherwise `logic` does it and the first frame is skipped.
-    pub fn setup_context(ctx: &egui::Context, kind: theme::ThemeKind) {
-        theme::install_fonts(ctx);
-        egui_extras::install_image_loaders(ctx);
-        theme::apply(ctx, kind);
-        // egui's own ⌘+ / ⌘- / ⌘0 scale the whole interface; PhotoCraft zooms the canvas instead
-        // (shortcuts.rs), like Photoshop.
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
-    }
-}
-
-impl PhotocraftApp {
-    /// Cached `Surface::content_bounds` keyed by an id and the surface's tile identity.
-    pub fn cached_bounds(&mut self, key: u64, surface: &photocraft_raster::Surface) -> photocraft_geom::Rect {
-        let rev = surface_fingerprint(surface);
-        if let Some((r, b)) = self.bounds_cache.get(&key)
-            && *r == rev
-        {
-            return *b;
-        }
-        let b = surface.content_bounds();
-        if self.bounds_cache.len() > 256 {
-            self.bounds_cache.clear();
-        }
-        self.bounds_cache.insert(key, (rev, b));
-        b
-    }
-}
-
-impl PhotocraftApp {
-    /// Zoom of the active document's main view (screen points per document pixel).
-    pub fn current_zoom(&self) -> f32 {
-        self.session.active_index().and_then(|i| self.ui.views.get(i)).map_or(1.0, |v| v.zoom)
-    }
-}
-
-impl PhotocraftApp {
-    /// Channels panel thumbnails of the active document snapshot: the composite,
-    /// each colour channel (when there is more than one), each alpha channel, then the Quick Mask.
-    pub fn channel_thumbs(&mut self, ctx: &egui::Context) -> Vec<egui::TextureId> {
-        let Some(st) = self.session.active() else {
-            self.channel_thumbs = None;
-            return Vec::new();
-        };
-        let (id, doc) = (st.doc.id, st.doc.clone());
-        // View-only commands bump revision without changing pixels. Keeping a Weak pins allocation
-        // identity against address reuse without retaining the document's pixel data.
-        let snapshot = std::sync::Arc::downgrade(&doc);
-        if !matches!(&self.channel_thumbs, Some((d, old, _)) if *d == id && old.ptr_eq(&snapshot)) {
-            let comp = photocraft_compose::thumbnail(&doc, 56);
-            let (w, h) = (comp.width as usize, comp.height as usize);
-            let side = w.max(h);
-            let make = |f: &dyn Fn(&[u8]) -> egui::Color32, name: &str| {
-                let mut px = vec![egui::Color32::TRANSPARENT; side * side];
-                let (ox, oy) = ((side - w) / 2, (side - h) / 2);
-                for y in 0..h {
-                    for x in 0..w {
-                        let o = (y * w + x) * 4;
-                        px[(y + oy) * side + x + ox] = f(&comp.pixels[o..o + 4]);
+        fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+            let held = self.0.entry(input.viewport_id).or_default();
+            let mut events = Vec::with_capacity(input.events.len());
+            for event in std::mem::take(&mut input.events) {
+                match &event {
+                    egui::Event::ModifiersChanged(now) => *held = *now,
+                    egui::Event::WindowFocused(false) => *held = egui::Modifiers::NONE,
+                    egui::Event::PointerButton { modifiers, .. } | egui::Event::Key { modifiers, .. } | egui::Event::MouseWheel { modifiers, .. }
+                        if *modifiers != *held =>
+                    {
+                        *held = *modifiers;
+                        events.push(egui::Event::ModifiersChanged(*modifiers));
                     }
+                    _ => {}
                 }
-                ctx.load_texture(format!("chan-{name}"), egui::ColorImage::new([side, side], px), egui::TextureOptions::LINEAR)
-            };
-            let fmt = doc.pixel_format();
-            let colors = fmt.mode.color_channels();
-            let mut texs = vec![make(&|p| egui::Color32::from_rgb(p[0], p[1], p[2]), "composite")];
-            if colors > 1 {
-                for k in 0..colors {
-                    let cmyk = fmt.mode == photocraft_doc::ColorMode::Cmyk;
-                    texs.push(make(
-                        &|p| {
-                            let rgba = [p[0], p[1], p[2], 255].map(|v| f32::from(v) / 255.0);
-                            let x = photocraft_raster::from_rgba(&fmt, rgba)[k];
-                            let g = if cmyk { 1.0 - x } else { x };
-                            egui::Color32::from_gray((g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-                        },
-                        &format!("c{k}"),
-                    ));
-                }
+                events.push(event);
             }
-            // Alpha channels and the Quick Mask, sampled at thumbnail resolution.
-            let (dw, dh) = (doc.size.width.max(1) as f32, doc.size.height.max(1) as f32);
-            for (i, ch) in doc.channels.iter().chain(doc.quick_mask.as_ref()).enumerate() {
-                let mut px = vec![egui::Color32::TRANSPARENT; side * side];
-                let (ox, oy) = ((side - w) / 2, (side - h) / 2);
-                for y in 0..h {
-                    for x in 0..w {
-                        let sx = ((x as f32 + 0.5) * dw / w as f32) as i32;
-                        let sy = ((y as f32 + 0.5) * dh / h as f32) as i32;
-                        let v = ch.surface.sample_channel(sx, sy, 0);
-                        px[(y + oy) * side + x + ox] = egui::Color32::from_gray((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-                    }
-                }
-                texs.push(ctx.load_texture(format!("chan-a{i}"), egui::ColorImage::new([side, side], px), egui::TextureOptions::LINEAR));
-            }
-            self.channel_thumbs = Some((id, snapshot, texs));
-        }
-        self.channel_thumbs.as_ref().map(|(_, _, t)| t.iter().map(|t| t.id()).collect()).unwrap_or_default()
-    }
-}
-
-fn clip_signature(w: u32, h: u32, px: &[u8]) -> u64 {
-    let mut sig = (w as u64) << 32 | h as u64;
-    for b in px.iter().step_by(997) {
-        sig = sig.rotate_left(5) ^ *b as u64;
-    }
-    sig
-}
-
-impl PhotocraftApp {
-    /// Mirror the session clipboard onto the OS clipboard (RGBA8).
-    fn export_os_clipboard(&mut self) {
-        let (Some(set), Some(clip)) = (self.services.clipboard_set_image.as_mut(), self.session.clipboard.as_ref()) else { return };
-        let b = clip.bounds;
-        if b.is_empty() {
-            return;
-        }
-        let mut px = vec![[0u8; 4]; b.width() as usize * b.height() as usize];
-        clip.surface.read_rgba8_into(b, &mut px);
-        let bytes: Vec<u8> = px.into_iter().flatten().collect();
-        if set(b.width(), b.height(), &bytes).is_ok() {
-            self.os_clip_sig = Some(clip_signature(b.width(), b.height(), &bytes));
+            input.events = events;
         }
     }
 
-    /// If the OS clipboard holds an image that isn't the one we put there, make it the session
-    /// clipboard (so ⌘V pastes screenshots and images copied in other apps, like Photoshop).
-    /// Returns true when a new external image was imported.
-    pub(crate) fn import_os_clipboard(&mut self) -> bool {
-        let Some(get) = self.services.clipboard_get_image.as_mut() else { return false };
-        let Some((w, h, bytes)) = get() else { return false };
-        if w == 0 || h == 0 || bytes.len() != w as usize * h as usize * 4 {
-            return false;
-        }
-        let sig = clip_signature(w, h, &bytes);
-        if self.os_clip_sig == Some(sig) && self.session.clipboard.is_some() {
-            return false;
-        }
-        let r = photocraft_geom::Rect::new(0, 0, w as i32, h as i32);
-        let mut surface = photocraft_raster::Surface::from_interleaved(photocraft_color::PixelFormat::RGBA8, r, &bytes);
-        surface.prune();
-        self.session.clipboard = Some(photocraft_engine::edit_cmds::Clip { surface, bounds: r });
-        self.os_clip_sig = Some(sig);
-        self.clip_external = true;
-        true
+    /// One pass of `ui` on `ctx` with `input`, its output taken as the window's renderer takes it: no renderer applies
+    /// the texture changes in a test, so they are consumed here and the output drops clean.
+    pub(crate) fn run_ui(ctx: &egui::Context, input: egui::RawInput, ui: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+        let mut output = ctx.run_ui(input, ui);
+        output.textures_delta.clear();
+        output
     }
 }
+
+#[cfg(test)]
+mod navigator_gpu_tests;
+
+#[cfg(test)]
+mod color_swatch_tests;
+#[cfg(test)]
+mod dialog_title_ellipsis_tests;
+
+#[cfg(test)]
+mod profile_open_tests;
 
 #[cfg(test)]
 mod input_tests;
 
 #[cfg(test)]
+mod home_chrome_tests;
+
+#[cfg(test)]
+mod pen_variants_tests;
+
+#[cfg(test)]
+mod color_replacement_digit_keys_tests;
+#[cfg(test)]
+mod color_replacement_tests;
+#[cfg(test)]
+mod home_recent_gate_tests;
+#[cfg(test)]
+mod layers_panel_nodes;
+#[cfg(test)]
+mod live_retouch_tests;
+#[cfg(test)]
+mod lock_layers_shortcut_tests;
+#[cfg(test)]
 mod pencil_tests;
+#[cfg(test)]
+mod smart_objects_menu_tests;
+#[cfg(test)]
+mod tool_shift_cycle_order_tests;
+#[cfg(test)]
+mod tool_shortcut_tests;
+#[cfg(test)]
+mod toolbar_custom_group_layout_tests;
+#[cfg(test)]
+mod toolbar_group_order_tests;
+
+#[cfg(test)]
+mod pixel_aspect_tests;
+
+#[cfg(test)]
+mod transform_controls_pointer_tests;
+#[cfg(test)]
+mod transform_fx_tests;
+
+#[cfg(test)]
+mod transform_commit_click_tests;
+#[cfg(test)]
+mod transform_drag_start_tests;
+
+#[cfg(test)]
+mod artboard_from_group_label_tests;
+#[cfg(test)]
+mod layer_props_ui_tests;
+#[cfg(test)]
+mod notice_text_tests;
+#[cfg(test)]
+mod transform_switch_tests;
+#[cfg(test)]
+mod transform_task_bar_tests;
+#[cfg(test)]
+mod transform_undo_tests;
+
+#[cfg(test)]
+mod transform_type_tests;
+
+#[cfg(test)]
+mod star_tool_tests;
+
+#[cfg(test)]
+mod new_doc_bitmap_mode_tests;
+
+#[cfg(test)]
+mod transform_several_tests;
+
+#[cfg(test)]
+mod transform_selection_rules_tests;
+
+#[cfg(test)]
+mod psd_open_tests;
+#[cfg(test)]
+mod save_identity_tests;
+
+#[cfg(test)]
+mod move_shift_click_tests;
+
+#[cfg(test)]
+mod move_target_default_tests;
+
+#[cfg(test)]
+mod wand_press_inside_selection_tests;
+
+#[cfg(test)]
+mod move_history_names_tests;
+#[cfg(test)]
+mod move_shift_diagonal_tests;
+
+#[cfg(test)]
+mod layers_footer_tests;
+#[cfg(test)]
+mod layers_rows_tests;
+#[cfg(test)]
+mod layers_thumbnail_tests;
+
+#[cfg(test)]
+mod color_panel_tests;
+#[cfg(test)]
+mod color_tab_theme_tests;
+
+#[cfg(test)]
+mod new_layer_button_tests;
+
+#[cfg(test)]
+mod smart_filter_rows_tests;
+
+#[cfg(test)]
+mod blur_pins_tests;
+
+#[cfg(test)]
+mod filter_preview_locator_tests;
+
+#[cfg(test)]
+mod move_outline_tests;
+
+#[cfg(test)]
+mod move_bar_distribute_gear_tests;
+
+#[cfg(test)]
+mod brush_picker_memo_trials;
+#[cfg(test)]
+mod brush_settle_trials;
+#[cfg(test)]
+mod chrome_settle_trials;
+#[cfg(test)]
+mod command_state_trials;
+#[cfg(test)]
+mod doc_revision_trials;
+#[cfg(test)]
+mod doc_tracked_trials;
+#[cfg(test)]
+mod drag_settle_trials;
+#[cfg(test)]
+mod layer_thumb_bounds_tests;
+#[cfg(test)]
+mod mask_thumb_refresh_tests;
+#[cfg(test)]
+mod menu_floor_trials;
+#[cfg(test)]
+mod scratch_read_keys_tests;
+
+#[cfg(test)]
+mod new_doc_remember_tests;
+
+#[cfg(test)]
+mod hidden_layer_tests;
+
+#[cfg(test)]
+mod warp_text_dialog_tests;
+
+#[cfg(test)]
+mod options_bar_mode_wheel_tests;
+
+#[cfg(test)]
+mod field_wheel_app_tests;
+
+#[cfg(test)]
+mod brush_shift_drag_axis_tests;
 
 #[cfg(test)]
 mod marquee_tests;
 
 #[cfg(test)]
-mod clipboard_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
+mod single_line_marquee_move_tests;
 
-    #[test]
-    fn os_clipboard_bridge() {
-        let os: OsClip = Arc::default();
-        let (a, b) = (os.clone(), os.clone());
-        let services = Services {
-            clipboard_set_image: Some(Box::new(move |w: u32, h: u32, px: &[u8]| {
-                *a.lock().unwrap() = Some((w, h, px.to_vec()));
-                Ok(())
-            })),
-            clipboard_get_image: Some(Box::new(move || b.lock().unwrap().clone())),
-            ..Default::default()
-        };
-        let mut app = PhotocraftApp::new(Session::new(), services);
-        app.session.execute("file.new", serde_json::json!({"width": 64, "height": 64})).unwrap();
-        app.sync_views();
-        app.run("select.rect", serde_json::json!({"x": 0, "y": 0, "width": 8, "height": 4})).unwrap();
-        app.run("edit.copy", serde_json::json!({})).unwrap();
-        let (w, h, px) = os.lock().unwrap().clone().unwrap();
-        assert_eq!((w, h, px.len()), (8, 4, 8 * 4 * 4));
-        // Our own image comes back unchanged (no re-import, keeps the original position).
-        assert!(!app.import_os_clipboard());
-        // Another app puts a 3×2 red image on the clipboard: ⌘V pastes it.
-        *os.lock().unwrap() = Some((3, 2, [255u8, 0, 0, 255].repeat(6)));
-        app.run("edit.paste", serde_json::json!({})).unwrap();
-        let st = app.session.active().unwrap();
-        let surf = st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap();
-        assert_eq!(surf.content_bounds().width(), 3);
-    }
+#[cfg(test)]
+mod guide_cursor_tests;
 
-    type OsClip = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
+#[cfg(test)]
+mod canvas_menu_tests;
 
-    /// An app whose OS clipboard is `os`, counting every read in `reads`.
-    fn app_with_os_clipboard(os: &OsClip, reads: &Arc<std::sync::atomic::AtomicUsize>) -> PhotocraftApp {
-        let (b, n) = (os.clone(), reads.clone());
-        let get = move || {
-            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            b.lock().unwrap().clone()
-        };
-        let mut app = PhotocraftApp::new(Session::new(), Services { clipboard_get_image: Some(Box::new(get)), ..Default::default() });
-        app.session.execute("file.new", serde_json::json!({"width": 64, "height": 64})).unwrap();
-        app.sync_views();
-        app
-    }
+#[cfg(test)]
+mod nudge_bundle_tests;
 
-    #[test]
-    fn external_clipboard_enables_and_centres_paste() {
-        // Paste is enabled from the clipboard service alone (no read); the explicit paste imports
-        // the OS image, once, and centres it like Photoshop does for foreign clipboard content.
-        let (os, reads) = (OsClip::default(), Arc::default());
-        let mut app = app_with_os_clipboard(&os, &reads);
-        *os.lock().unwrap() = Some((4, 4, [255u8, 0, 0, 255].repeat(16)));
-        assert!(app.session.clipboard.is_none());
-        assert!(crate::menus::is_enabled(&app, "edit.paste"));
-        assert!(crate::menus::is_enabled(&app, "edit.pasteSpecial.pasteInPlace"));
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "enablement never reads the clipboard");
-        let r = crate::menus::invoke(&mut app, &egui::Context::default(), "edit.paste", serde_json::json!({})).unwrap();
-        assert_ne!(r["offset"], serde_json::json!([0, 0]), "external image is centred: {r}");
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "one read per explicit paste");
-        // Without a clipboard service Paste greys until something is copied in the app.
-        let mut plain = PhotocraftApp::new(Session::new(), Services::default());
-        plain.session.execute("file.new", serde_json::json!({"width": 8, "height": 8})).unwrap();
-        assert!(!crate::menus::is_enabled(&plain, "edit.paste"));
-    }
+#[cfg(test)]
+mod caps_lock_tests;
 
-    #[test]
-    fn pasting_an_empty_or_non_image_os_clipboard_is_a_quiet_no_op() {
-        let (os, reads) = (OsClip::default(), Arc::default());
-        let mut app = app_with_os_clipboard(&os, &reads);
-        let layers = app.session.active().unwrap().doc.layers.len();
-        let r = crate::menus::invoke(&mut app, &egui::Context::default(), "edit.paste", serde_json::json!({})).unwrap();
-        assert_eq!(r["pasted"], serde_json::json!(false));
-        assert_eq!(app.run("edit.pasteSpecial.pasteInPlace", serde_json::json!({})).unwrap()["pasted"], serde_json::json!(false));
-        assert_eq!(app.session.active().unwrap().doc.layers.len(), layers);
-        assert!(!app.ui.status_error && !app.ui.status.is_empty());
-    }
+#[cfg(test)]
+mod view_sync_tests;
 
-    #[test]
-    fn idle_frames_never_read_the_os_clipboard() {
-        let (os, reads) = (OsClip::default(), Arc::<std::sync::atomic::AtomicUsize>::default());
-        *os.lock().unwrap() = Some((4, 4, [255u8, 0, 0, 255].repeat(16)));
-        let (b, n) = (os.clone(), reads.clone());
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).with_max_steps(64).build_eframe(move |cc| {
-            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
-            let get = move || {
-                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                b.lock().unwrap().clone()
-            };
-            let mut app = PhotocraftApp::new(Session::new(), Services { clipboard_get_image: Some(Box::new(get)), ..Default::default() });
-            app.session.execute("file.new", serde_json::json!({"width": 64, "height": 64})).unwrap();
-            app
-        });
-        for _ in 0..20 {
-            h.step();
-        }
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "the OS clipboard is read only on an explicit paste");
-        assert!(h.state().session.clipboard.is_none());
-    }
-}
+#[cfg(test)]
+mod stamp_tests;
+
+#[cfg(test)]
+mod alt_click_tests;
+#[cfg(test)]
+mod artboard_first_board_tests;
+#[cfg(test)]
+mod brush_resize_overlay_tests;
+#[cfg(test)]
+mod stroke_timing_tests;
+
+#[cfg(test)]
+mod patch_reset_tool_tests;
+#[cfg(test)]
+mod patch_tool_history_names_tests;
+#[cfg(test)]
+mod polygon_lasso_tests;
+
+#[cfg(test)]
+mod window_frame_tests;
+
+#[cfg(test)]
+mod artboards_export_options_dialog_tests;
+#[cfg(test)]
+mod artboards_overlap_dialog_tests;
+#[cfg(test)]
+mod artboards_to_files_types_tests;
+#[cfg(test)]
+mod artboards_to_pdf_reverse_tests;
+#[cfg(test)]
+mod browse_field_tests;
+#[cfg(test)]
+mod export_quality_tests;
+#[cfg(test)]
+mod select_and_mask_button_tests;
+#[cfg(test)]
+mod wand_tolerance_field_tests;
+
+#[cfg(test)]
+mod saved_path_edit_tests;
+
+#[cfg(test)]
+mod pen_path_ownership_tests;
+
+#[cfg(test)]
+mod artboard_options_bar_tests;
+#[cfg(test)]
+mod artboards_include_name_dialog_tests;
+
+#[cfg(test)]
+mod doc_tab_menu_tests;
+#[cfg(test)]
+mod preferences_submenu_tests;
+#[cfg(test)]
+mod selection_move_step_tests;
+#[cfg(test)]
+mod view_guides_submenu_tests;
+
+#[cfg(test)]
+mod lasso_click_tests;
+#[cfg(test)]
+mod reset_tip_tests;
+#[cfg(test)]
+mod rotate_steps_tests;
+#[cfg(test)]
+mod zoom_mode_tests;
+
+#[cfg(test)]
+mod red_eye_context_menu_tests;
+
+#[cfg(test)]
+mod clone_stamp_indexed_bar_tests;
+
+#[cfg(test)]
+mod place_visible_centre_tests;

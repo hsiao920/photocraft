@@ -1,149 +1,114 @@
-//! Icon rendering. SVGs are embedded (see `icon_data.rs`), recoloured to white, rasterized by the
-//! egui_extras SVG loader at the exact on-screen pixel size (crisp at any DPI), and tinted per use.
-//!
-//! (History: the first shell used Unicode glyphs; half of them rendered as tofu boxes because the
-//! bundled fonts lacked them. Vector icons fix that for good.)
+//! PhotoCraft's icon names. The glyphs come from the framework's catalog and from the app's own set in
+//! `icon_data.rs`, registered once by [`register`]; drawing is the framework's `Icon` / `IconSpec::svg`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use egui::{Color32, Rect, Response, Sense, Vec2};
+use craft::behavior::IconId;
+use craft::ui::contract::CommandSet;
+use craft::ui::primitives::register_app_icons;
 
-use crate::icon_data::ICONS;
+use crate::icon_data::PHOTOCRAFT_ICONS;
+use crate::panels::tool_commands::{ToolCommand, command_of};
 use crate::state::Tool;
-use crate::theme::Tokens;
 
-fn white_icons() -> &'static HashMap<&'static str, Arc<[u8]>> {
-    static MAP: OnceLock<HashMap<&'static str, Arc<[u8]>>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        ICONS
-            .iter()
-            .map(|(name, bytes)| {
-                let svg = String::from_utf8_lossy(bytes).replace("currentColor", "#ffffff").replace("stroke-width=\"2\"", "stroke-width=\"1.75\"");
-                (*name, Arc::from(svg.into_bytes().into_boxed_slice()))
-            })
-            .collect()
-    })
+/// Registers the app's own icon set with the framework. The registry is process-wide and ignores a set
+/// registered twice, so a second window or a test may call it again.
+pub fn register() {
+    register_app_icons(&PHOTOCRAFT_ICONS);
 }
 
-pub fn exists(name: &str) -> bool {
-    white_icons().contains_key(name)
-}
+/// Panel footer buttons share one glyph per action and one size, so the Layers footer and the
+/// Swatches, Gradients and Patterns footers read the same, as in Photoshop (#10656).
+pub const FOOTER_SIZE: f32 = 26.0;
+/// The footer's "new" glyph.
+pub const FOOTER_NEW: &str = "square_plus";
+/// The footer's "new group" glyph.
+pub const FOOTER_NEW_GROUP: &str = "folder";
+/// The footer's "delete" glyph.
+pub const FOOTER_DELETE: &str = "trash";
 
-/// An egui image for an icon, tinted.
-pub fn image(name: &str, size: f32, tint: Color32) -> egui::Image<'static> {
-    let bytes = white_icons().get(name).or_else(|| white_icons().get("square")).cloned().unwrap_or_default();
-    egui::Image::from_bytes(format!("bytes://icons/{name}.svg"), egui::load::Bytes::Shared(bytes)).fit_to_exact_size(Vec2::splat(size)).tint(tint)
-}
-
-/// Paint an icon centred in `rect`.
-pub fn paint(ui: &egui::Ui, rect: Rect, name: &str, size: f32, tint: Color32) {
-    let r = Rect::from_center_size(rect.center(), Vec2::splat(size));
-    image(name, size, tint).paint_at(ui, r);
-}
-
-pub fn tool_icon(t: Tool) -> &'static str {
-    match t {
-        Tool::Move => "move",
-        Tool::RectMarquee => "square-dashed",
-        Tool::EllipseMarquee => "circle-dashed",
-        Tool::Brush => "brush",
-        Tool::Pencil => "pencil",
-        Tool::Eraser => "eraser",
-        Tool::BackgroundEraser => "eraser-background",
-        Tool::MagicEraser => "eraser-magic",
-        Tool::Eyedropper => "pipette",
-        Tool::Ruler => "ruler",
-        Tool::Note => "message-square",
-        Tool::Count => "circle-dot",
-        Tool::Lasso => "lasso",
-        Tool::PolygonLasso => "pentagon",
-        Tool::MagicWand => "wand-sparkles",
-        Tool::Crop => "crop",
-        Tool::Slice => "slice-knife",
-        Tool::SliceSelect => "square-dashed-mouse-pointer",
-        Tool::Gradient => "blend",
-        Tool::PaintBucket => "paint-bucket",
-        Tool::Type => "type",
-        Tool::Hand => "hand",
-        Tool::Zoom => "zoom-in",
-        Tool::SpotHealing | Tool::Healing => "bandage",
-        Tool::CloneStamp => "stamp",
-        Tool::HistoryBrush => "clock",
-        Tool::Blur => "droplet",
-        Tool::Sharpen => "triangle",
-        Tool::Smudge => "pointer",
-        Tool::Dodge => "lollipop",
-        Tool::Burn => "flame",
-        Tool::Sponge => "cloud",
-        Tool::QuickSelection => "circle-dashed",
-        Tool::ObjectSelection => "square-dashed-mouse-pointer",
-        Tool::Pen => "pen-tool",
-        Tool::PathSelection => "mouse-pointer-2",
-        Tool::Rectangle => "rectangle-horizontal",
-        Tool::EllipseShape => "circle",
-        Tool::Triangle => "triangle",
-        Tool::Polygon => "pentagon",
-        Tool::Line => "slash",
-        Tool::CustomShape => "cloud",
-    }
-}
-
-/// Square icon button: transparent until hovered; `selected` gets the accent treatment.
-pub fn button(ui: &mut egui::Ui, name: &str, box_size: f32, selected: bool, tooltip: &str) -> Response {
-    let t = Tokens::get(ui.ctx());
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(box_size), Sense::click());
-    let hovered = resp.hovered();
-    if selected {
-        ui.painter().rect_filled(rect, t.radius_sm, t.accent_soft);
-        ui.painter().rect_stroke(rect, t.radius_sm, egui::Stroke::new(1.0, t.accent_border), egui::StrokeKind::Inside);
-    } else if hovered {
-        ui.painter().rect_filled(rect, t.radius_sm, t.hover);
-    }
-    let tint = if selected {
-        t.accent_text
-    } else if hovered {
-        t.text
-    } else {
-        t.icon
-    };
-    paint(ui, rect, name, (box_size * 0.52).round(), tint);
-    if tooltip.is_empty() { resp } else { resp.on_hover_text(tl!(tooltip)) }
-}
-
-/// Rail toggle: "on" gets a quiet filled background and full-strength icon (no accent).
-pub fn rail_button(ui: &mut egui::Ui, name: &str, box_size: f32, on: bool, tooltip: &str) -> Response {
-    let t = Tokens::get(ui.ctx());
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(box_size), Sense::click());
-    if on {
-        ui.painter().rect_filled(rect, t.radius_sm, t.card);
-        ui.painter().rect_stroke(rect, t.radius_sm, egui::Stroke::new(1.0, t.card_border), egui::StrokeKind::Inside);
-    } else if resp.hovered() {
-        ui.painter().rect_filled(rect, t.radius_sm, t.hover);
-    }
-    let tint = if on || resp.hovered() { t.text } else { t.text_faint };
-    paint(ui, rect, name, (box_size * 0.52).round(), tint);
-    resp.on_hover_text(tl!(tooltip))
+/// The icon of tool `t`: the one its command names (`ToolCommand`'s `icon` attribute), which the tool rail also draws.
+pub fn tool_icon(t: Tool) -> IconId {
+    static ICONS: OnceLock<HashMap<String, Cow<'static, str>>> = OnceLock::new();
+    let icons =
+        ICONS.get_or_init(|| ToolCommand::defs().unwrap_or_default().into_iter().filter_map(|def| def.icon.map(|icon| (def.command.id, icon))).collect());
+    icons.get(command_of(t).id()).map_or_else(|| IconId::new("more"), |name| IconId::from(name.clone()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use craft::ui::primitives::has_icon;
 
+    use super::*;
+    use crate::icon_data::ICONS;
+
+    /// A missing glyph paints nothing and only logs, so a call site left on a renamed (hyphenated)
+    /// name is caught here: every name PhotoCraft asks for resolves once the app set is registered.
     #[test]
-    fn every_tool_has_an_icon() {
+    fn every_name_photocraft_asks_for_resolves() {
+        register();
+        register();
         for t in Tool::ALL {
-            assert!(exists(tool_icon(t)), "{t:?}");
+            assert!(has_icon(&tool_icon(t)), "{t:?}: {}", tool_icon(t).name());
+        }
+        // The rail draws each command's own icon, so every command's attribute resolves too.
+        for def in ToolCommand::defs().expect("tool commands define") {
+            let name = def.icon.unwrap_or_else(|| panic!("{} names no icon", def.command.id));
+            assert!(has_icon(&IconId::from(name.clone())), "{}: {name}", def.command.id);
+        }
+        for name in [FOOTER_NEW, FOOTER_NEW_GROUP, FOOTER_DELETE, "symmetry_vertical", "symmetry_horizontal", "symmetry_diagonal", "symmetry_dual"] {
+            assert!(has_icon(&IconId::new(name)), "{name}");
+        }
+        for &(name, _) in ICONS {
+            assert!(has_icon(&IconId::new(name)), "{name}");
         }
     }
 
+    /// Every panel's iconic form draws the registry's icon, so each registry name resolves.
     #[test]
-    fn icons_are_recoloured() {
-        let m = white_icons();
-        assert!(m.len() >= 60);
-        for (name, b) in m.iter() {
-            let s = std::str::from_utf8(b).unwrap();
-            assert!(!s.contains("currentColor"), "{name}");
+    fn every_panel_icon_resolves() {
+        register();
+        for panel in crate::panels::registry::PANELS {
+            assert!(has_icon(&IconId::new(panel.icon)), "panel {}: icon {:?} is not in the catalog", panel.id, panel.icon);
         }
+    }
+
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("source dir reads").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// An unknown id paints nothing and only logs, so every id written as a string literal in the sources must resolve.
+    /// Ids built in match arms are not scanned.
+    #[test]
+    fn every_icon_id_literal_in_the_sources_resolves() {
+        register();
+        let form = concat!("IconId", "::new(\"");
+        let mut files = Vec::new();
+        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let (mut seen, mut unknown) = (0, Vec::new());
+        for file in files.iter().filter(|file| !file.ends_with("icons.rs")) {
+            let text = std::fs::read_to_string(file).expect("source reads");
+            for (number, line) in text.lines().enumerate().filter(|(_, line)| !line.trim_start().starts_with("//")) {
+                for (at, _) in line.match_indices(form) {
+                    let rest = &line[at + form.len()..];
+                    let Some(end) = rest.find('"') else { continue };
+                    seen += 1;
+                    if !has_icon(&IconId::new(String::leak(rest[..end].to_owned()))) {
+                        unknown.push(format!("{}:{}: {:?}", file.display(), number + 1, &rest[..end]));
+                    }
+                }
+            }
+        }
+        assert!(seen > 20, "the scan found {seen} icon ids: its pattern no longer matches the sources");
+        assert!(unknown.is_empty(), "icon ids that are not in the catalog:\n{}", unknown.join("\n"));
     }
 }

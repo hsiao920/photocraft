@@ -34,12 +34,14 @@ impl Class {
 /// prefix.
 pub const TABLE: &[(&str, Class)] = &[
     ("geom", Class::Layer(0)),
-    ("cms", Class::Layer(0)),
     ("color", Class::Layer(0)),
     ("raster", Class::Layer(0)),
-    ("psd", Class::Standalone),
     ("codecs", Class::Standalone),
+    // Optional HEIF/HEIC decoder (heic-rs), used only by `codecs` behind its `heif` feature.
+    // IPP client for CUPS printing (pure Rust, no dependencies), used by `engine` on Unix.
+    ("ipp", Class::Standalone),
     ("raw", Class::Standalone),
+    ("affinity", Class::Standalone),
     ("adobe-assets", Class::Standalone),
     // Pen tablet input (the one isolated `unsafe` helper: AppKit interop on macOS).
     ("tablet", Class::Standalone),
@@ -57,23 +59,30 @@ pub const TABLE: &[(&str, Class)] = &[
     ("viewport", Class::Layer(4)),
     ("ml", Class::Layer(4)),
     ("plugins", Class::Layer(4)),
+    ("engine-core", Class::Layer(5)),
+    ("engine-paint", Class::Layer(5)),
+    ("engine-vector", Class::Layer(5)),
     ("engine", Class::Layer(5)),
     ("ui-egui", Class::Layer(6)),
     ("automation", Class::Layer(6)),
     ("platform", Class::Layer(6)),
     ("testkit", Class::Testkit),
+    ("oil-round-proof", Class::Testkit),
     // L7 apps and tooling
     ("photocraft", Class::Exempt),
     ("cli", Class::Exempt),
     ("web", Class::Exempt),
+    ("web-boot", Class::Exempt),
     ("xtask", Class::Exempt),
 ];
 
 /// Explicit orderings *within* a layer (earlier may be used by later).
 /// The L0 foundation is a small chain: `raster` builds on `color` and
 /// `geom`, which the §3 diagram draws on one line. The GPU backend (`gpu`)
-/// reuses the CPU reference (`compose`) for LUTs and parity tests.
-pub const INTRA_LAYER_ORDER: &[&[&str]] = &[&["geom", "cms", "color", "raster"], &["compose", "gpu"]];
+/// reuses the CPU reference (`compose`) for LUTs and parity tests. The engine's crates form one
+/// chain per leaf crate, from `engine-core` to the top crate `engine` (photocraft#15710).
+pub const INTRA_LAYER_ORDER: &[&[&str]] =
+    &[&["geom", "color", "raster"], &["compose", "gpu"], &["engine-core", "engine-paint", "engine"], &["engine-core", "engine-vector", "engine"]];
 
 fn intra_layer_allowed(from: &str, to: &str) -> bool {
     let (from, to) = (short_name(from), short_name(to));
@@ -83,9 +92,25 @@ fn intra_layer_allowed(from: &str, to: &str) -> bool {
     })
 }
 
+/// The only workspace dependencies a standalone crate may have: (from, to), both standalone and
+/// both publishable. None at present: the one there was, `codecs` → `heif`, ended when the HEIF
+/// decoder moved to craft-libs as `craft-heif` (craft-libs#784).
+pub const STANDALONE_EXCEPTIONS: &[(&str, &str)] = &[];
+
+fn standalone_exception(from: &str, to: &str) -> bool {
+    let (from, to) = (short_name(from), short_name(to));
+    classify(to) == Some(Class::Standalone) && STANDALONE_EXCEPTIONS.iter().any(|(f, t)| *f == from && *t == to)
+}
+
 /// External crates that constitute a UI toolkit / windowing dependency.
 /// Entries ending in `*` are prefixes.
-pub const UI_CRATES: &[&str] = &["egui", "eframe", "winit", "egui_kittest", "rfd", "bevy*"];
+pub const UI_CRATES: &[&str] = &["egui", "eframe", "winit", "egui_kittest", "craft-ui", "rfd", "bevy*"];
+
+/// Facade crates that are a UI toolkit dependency only with some of their features (#15467): `craft` carries the
+/// whole craft UI framework behind `ui` (and the features that turn it on), while lower layers use its non-UI parts
+/// (imaging, fonts, keymap, settings). `keymap-egui` adds the keymap's egui key conversions, which bring egui itself.
+/// Feature names ending in `*` are prefixes.
+pub const UI_FEATURES: &[(&str, &[&str])] = &[("craft", &["ui", "ui-*", "screen-testing", "keymap-egui"])];
 
 /// First layer allowed to use UI crates.
 pub const UI_MIN_LAYER: u8 = 6;
@@ -99,11 +124,17 @@ pub fn classify(pkg: &str) -> Option<Class> {
     TABLE.iter().find(|(n, _)| *n == s).map(|(_, c)| *c)
 }
 
-fn is_ui_crate(name: &str) -> bool {
-    UI_CRATES.iter().any(|p| match p.strip_suffix('*') {
+fn matches_pattern(name: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('*') {
         Some(prefix) => name.starts_with(prefix),
-        None => name == *p,
-    })
+        None => name == pattern,
+    }
+}
+
+/// Whether `dep` brings a UI toolkit: a crate in [`UI_CRATES`], or a [`UI_FEATURES`] facade with one of its UI features.
+fn is_ui_dep(dep: &Dep) -> bool {
+    UI_CRATES.iter().any(|p| matches_pattern(&dep.name, p))
+        || UI_FEATURES.iter().any(|(krate, features)| dep.name == *krate && dep.features.iter().any(|f| features.iter().any(|p| matches_pattern(f, p))))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +150,8 @@ pub struct Dep {
     pub kind: DepKind,
     /// `true` if the dependency is a workspace member.
     pub workspace: bool,
+    /// The features the dependency is declared with (including the ones inherited from the workspace).
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,17 +210,17 @@ pub fn check(crates: &[Crate]) -> Vec<Violation> {
             }
             if d.workspace {
                 if class == Class::Standalone {
+                    if standalone_exception(&c.name, &d.name) {
+                        continue;
+                    }
                     out.push(Violation::StandaloneHasWorkspaceDep { krate: c.name.clone(), dep: d.name.clone() });
                     continue;
                 }
                 match classify(&d.name) {
                     // Unregistered deps are reported on their own entry.
                     None => {}
-                    Some(Class::Testkit) => {
-                        if d.kind != DepKind::Dev {
-                            out.push(Violation::TestkitAsNormalDep { krate: c.name.clone() });
-                        }
-                    }
+                    Some(Class::Testkit) if d.kind != DepKind::Dev => out.push(Violation::TestkitAsNormalDep { krate: c.name.clone() }),
+                    Some(Class::Testkit) => {}
                     Some(dc) => {
                         let to = dc.layer().unwrap_or(u8::MAX);
                         if to >= layer && !(to == layer && intra_layer_allowed(&c.name, &d.name)) {
@@ -201,7 +234,7 @@ pub fn check(crates: &[Crate]) -> Vec<Violation> {
                         }
                     }
                 }
-            } else if layer < UI_MIN_LAYER && is_ui_crate(&d.name) {
+            } else if layer < UI_MIN_LAYER && is_ui_dep(d) {
                 out.push(Violation::UiBelowL6 { krate: c.name.clone(), dep: d.name.clone(), layer });
             }
         }
@@ -227,12 +260,26 @@ pub fn from_metadata(meta: &Value) -> Result<Vec<Crate>, String> {
                 _ => DepKind::Normal,
             };
             let workspace = members.contains(&dname.as_str()) || d["path"].is_string();
-            deps.push(Dep { name: dname, kind, workspace });
+            let mut features: Vec<String> = d["features"].as_array().into_iter().flatten().filter_map(|f| f.as_str().map(str::to_owned)).collect();
+            // The package's own `[features]` can turn on a dependency's features (`default = ["craft/ui"]`), named by
+            // the dependency's key, which is its rename when it has one. Any of them may be on, so all count.
+            let key = d["rename"].as_str().unwrap_or(&dname);
+            features.extend(forwarded_features(&p["features"], key));
+            deps.push(Dep { name: dname, kind, workspace, features });
         }
         out.push(Crate { name, deps });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// The features of dependency `key` that the package's `[features]` table (`features` in `cargo metadata`) turns on:
+/// `key/feat` and `key?/feat` entries.
+fn forwarded_features<'a>(table: &'a Value, key: &'a str) -> impl Iterator<Item = String> + 'a {
+    table.as_object().into_iter().flat_map(|t| t.values()).filter_map(Value::as_array).flatten().filter_map(Value::as_str).filter_map(move |entry| {
+        let (dep, feature) = entry.split_once('/')?;
+        (dep.strip_suffix('?').unwrap_or(dep) == key).then(|| feature.to_owned())
+    })
 }
 
 pub fn describe(class: Option<Class>) -> String {
@@ -250,7 +297,7 @@ mod tests {
     use super::*;
 
     fn c(name: &str, deps: &[(&str, DepKind, bool)]) -> Crate {
-        Crate { name: name.into(), deps: deps.iter().map(|(n, k, w)| Dep { name: (*n).into(), kind: *k, workspace: *w }).collect() }
+        Crate { name: name.into(), deps: deps.iter().map(|(n, k, w)| Dep { name: (*n).into(), kind: *k, workspace: *w, features: Vec::new() }).collect() }
     }
     use DepKind::*;
 
@@ -288,7 +335,7 @@ mod tests {
 
     #[test]
     fn self_dev_dependency_ignored() {
-        assert!(check(&[c("photocraft-psd", &[("photocraft-psd", Dev, true)])]).is_empty());
+        assert!(check(&[c("photocraft-codecs", &[("photocraft-codecs", Dev, true)])]).is_empty());
     }
 
     #[test]
@@ -299,7 +346,7 @@ mod tests {
 
     #[test]
     fn standalone_crates_have_no_workspace_deps() {
-        for s in ["photocraft-psd", "photocraft-codecs", "photocraft-adobe-assets"] {
+        for s in ["photocraft-codecs", "photocraft-adobe-assets"] {
             let v = check(&[c(s, &[("photocraft-geom", Normal, true)])]);
             assert!(matches!(v[..], [Violation::StandaloneHasWorkspaceDep { .. }]), "{s}");
             assert!(check(&[c(s, &[("image", Normal, false)])]).is_empty());
@@ -307,20 +354,98 @@ mod tests {
     }
 
     #[test]
+    fn standalone_crates_have_no_exceptions() {
+        // Standalone crates may not use each other, in either direction.
+        for (from, to) in [("photocraft-codecs", "photocraft-adobe-assets"), ("photocraft-adobe-assets", "photocraft-codecs")] {
+            let v = check(&[c(from, &[(to, Normal, true)])]);
+            assert!(matches!(v[..], [Violation::StandaloneHasWorkspaceDep { .. }]), "{from} -> {to}");
+        }
+        // Nor layered crates.
+        let v = check(&[c("photocraft-codecs", &[("photocraft-geom", Normal, true)])]);
+        assert!(matches!(v[..], [Violation::StandaloneHasWorkspaceDep { .. }]));
+    }
+
+    #[test]
     fn standalone_is_usable_from_higher_layers() {
-        assert!(check(&[c("photocraft-io", &[("photocraft-psd", Normal, true)])]).is_empty());
+        assert!(check(&[c("photocraft-io", &[("photocraft-codecs", Normal, true)])]).is_empty());
         let v = check(&[c("photocraft-geom", &[("photocraft-codecs", Normal, true)])]);
         assert!(matches!(v[..], [Violation::Upward { from: 0, to: 0, .. }]));
     }
 
     #[test]
     fn ui_crates_below_l6_flagged() {
-        for dep in ["egui", "eframe", "winit", "egui_kittest", "rfd", "bevy_ecs", "bevy"] {
+        for dep in ["egui", "eframe", "winit", "egui_kittest", "craft-ui", "rfd", "bevy_ecs", "bevy"] {
             let v = check(&[c("photocraft-engine", &[(dep, Normal, false)])]);
             assert!(matches!(v[..], [Violation::UiBelowL6 { layer: 5, .. }]), "{dep}");
         }
         assert!(check(&[c("photocraft-engine", &[("egui_extras_not", Normal, false)])]).is_empty());
+        assert!(check(&[c("photocraft-ui-egui", &[("craft-ui", Normal, false)])]).is_empty());
         assert!(check(&[c("photocraft-platform", &[("winit", Normal, false)])]).is_empty());
+    }
+
+    fn with_features(name: &str, dep: &str, kind: DepKind, features: &[&str]) -> Crate {
+        let features = features.iter().map(|f| (*f).to_owned()).collect();
+        Crate { name: name.into(), deps: vec![Dep { name: dep.into(), kind, workspace: false, features }] }
+    }
+
+    #[test]
+    fn craft_facade_with_ui_features_flagged_below_l6() {
+        // #15467: the facade's UI features bring the whole craft UI framework.
+        for features in [&["ui"][..], &["imaging", "ui-app"], &["screen-testing"]] {
+            let v = check(&[with_features("photocraft-engine", "craft", Normal, features)]);
+            assert!(matches!(&v[..], [Violation::UiBelowL6 { layer: 5, dep, .. }] if dep == "craft"), "{features:?}");
+            let v = check(&[with_features("photocraft-text", "craft", Dev, features)]);
+            assert!(matches!(v[..], [Violation::UiBelowL6 { layer: 2, .. }]), "dev {features:?}");
+        }
+        // Its non-UI parts stay usable below L6 (what text, io and engine use today), and L6 may use it all.
+        for features in [&[][..], &["imaging"], &["font-catalog", "font-manager"], &["automation", "color-ui", "keymap", "platform", "settings"]] {
+            assert!(check(&[with_features("photocraft-engine", "craft", Normal, features)]).is_empty(), "{features:?}");
+        }
+        assert!(check(&[with_features("photocraft-ui-egui", "craft", Normal, &["ui", "screen-testing"])]).is_empty());
+        // Only the facade is judged by its features.
+        assert!(check(&[with_features("photocraft-engine", "craft-imaging", Normal, &["ui"])]).is_empty());
+    }
+
+    #[test]
+    fn metadata_reads_dependency_features() {
+        let meta: Value = serde_json::from_str(
+            r#"{"packages":[{"name":"photocraft-engine","dependencies":[
+                {"name":"craft","kind":null,"features":["keymap","ui"]}]}]}"#,
+        )
+        .unwrap();
+        let g = from_metadata(&meta).unwrap();
+        assert_eq!(g[0].deps[0].features, ["keymap", "ui"]);
+        assert!(matches!(check(&g)[..], [Violation::UiBelowL6 { .. }]));
+    }
+
+    /// The keymap's egui conversions bring egui; the plain keymap does not.
+    #[test]
+    fn keymap_egui_is_a_ui_feature() {
+        assert!(matches!(check(&[with_features("photocraft-engine", "craft", Normal, &["keymap-egui"])])[..], [Violation::UiBelowL6 { .. }]));
+        assert!(check(&[with_features("photocraft-engine", "craft", Normal, &["keymap"])]).is_empty());
+    }
+
+    /// A UI feature turned on by the package's own `[features]` (also through a renamed dependency) counts; other
+    /// forwarded features don't.
+    #[test]
+    fn metadata_reads_features_forwarded_by_the_package() {
+        let meta = |features: &str, rename: &str| -> Value {
+            serde_json::from_str(&format!(
+                r#"{{"packages":[{{"name":"photocraft-engine","features":{features},"dependencies":[
+                    {{"name":"craft","kind":null,"features":["keymap"]{rename}}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        for (features, rename) in [(r#"{"default":["craft/ui"]}"#, ""), (r#"{"gui":["c?/ui"]}"#, r#","rename":"c""#)] {
+            let g = from_metadata(&meta(features, rename)).unwrap();
+            assert!(matches!(check(&g)[..], [Violation::UiBelowL6 { .. }]), "{features}");
+        }
+        for (features, rename) in
+            [(r#"{"default":["craft/imaging"]}"#, ""), (r#"{"gui":["other/ui","dep:craft"]}"#, ""), (r#"{"gui":["craft/ui"]}"#, r#","rename":"c""#)]
+        {
+            let g = from_metadata(&meta(features, rename)).unwrap();
+            assert!(check(&g).is_empty(), "{features} {rename}: {:?}", check(&g));
+        }
     }
 
     #[test]
@@ -342,7 +467,7 @@ mod tests {
 
     #[test]
     fn apps_and_xtask_exempt() {
-        for app in ["photocraft", "photocraft-cli", "photocraft-web", "xtask"] {
+        for app in ["photocraft", "photocraft-cli", "photocraft-web", "photocraft-web-boot", "xtask"] {
             assert!(check(&[c(app, &[("egui", Normal, false), ("photocraft-ui-egui", Normal, true)])]).is_empty());
         }
     }

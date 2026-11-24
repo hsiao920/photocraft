@@ -16,6 +16,7 @@
 //! `--depth 16` or `--depth 32` converts the document to that bit depth after opening (the
 //! conversion is part of "open"), e.g. a 36 MP 16-bit refresh: `--size 7360x4912 --depth 16 --op refresh`.
 
+use photocraft_engine::color_cmds::ColorExt;
 use std::time::Instant;
 
 use eframe::egui_wgpu::RenderState;
@@ -174,6 +175,21 @@ fn main() {
             let path = refresh(gpu, &s, false);
             println!("Gaussian Blur r 10            {t1:>9.0} ms");
             println!("  refresh ({path:<8})           {:>9.0} ms", ms(t));
+        }
+        "invert" => {
+            // Image › Adjustments on the whole layer (#1772), then on a half-transparent layer.
+            let t = Instant::now();
+            exec(&mut s, "image.adjustments.invert", json!({}));
+            let t1 = ms(t);
+            let t = Instant::now();
+            let path = refresh(gpu, &s, false);
+            println!("Invert                        {t1:>9.0} ms   refresh ({path}) {:>6.0} ms", ms(t));
+            exec(&mut s, "select.rect", json!({"x": 0, "y": 0, "width": w / 2, "height": h}));
+            exec(&mut s, "layer.new.layerViaCopy", json!({}));
+            let t = Instant::now();
+            exec(&mut s, "image.adjustments.invert", json!({}));
+            println!("Invert, half-transparent layer {:>8.0} ms", ms(t));
+            json_rows.push(photocraft_testkit::perf::row("invert", &[t1], None, None));
         }
         "brush" => {
             exec(&mut s, "layer.new.layer", json!({"name": "paint"}));

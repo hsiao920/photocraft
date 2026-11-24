@@ -227,20 +227,30 @@ impl LensMap {
     }
 }
 
-/// Smallest scale (percent) at which the corrected image covers the whole frame (Auto Scale).
+/// Smallest scale (percent) at which every output pixel samples fully inside the frame (Auto Scale).
 pub fn auto_scale(lc: &LensCorrection, frame: Rect) -> f64 {
+    // Under 2 px a side no pixel centre can sample half a pixel inside, so no scale would do.
+    if frame.width() < 2 || frame.height() < 2 {
+        return lc.scale;
+    }
     let covers = |scale: f64| {
         let m = LensMap::new(&LensCorrection { scale, ..lc.clone() }, frame);
-        let (x0, y0, x1, y1) = (frame.x0 as f64, frame.y0 as f64, frame.x1 as f64, frame.y1 as f64);
-        (0..=40).all(|i| {
-            let t = i as f64 / 40.0;
-            [(x0 + t * (x1 - x0), y0), (x0 + t * (x1 - x0), y1), (x0, y0 + t * (y1 - y0)), (x1, y0 + t * (y1 - y0))]
-                .iter()
-                .all(|&(x, y)| m.sample(x, y).is_some_and(|s| s.p[0] >= x0 - 0.5 && s.p[0] <= x1 + 0.5 && s.p[1] >= y0 - 0.5 && s.p[1] <= y1 + 0.5))
+        // Every border pixel centre must sample at least half a pixel inside the frame: `remap`'s
+        // 1 px soft edge mixes the Edge fill into anything closer (#13992). Each one is checked,
+        // since rotation or perspective with distortion can put the extreme between sparse
+        // points.
+        let (x0, y0, x1, y1) = (frame.x0 as f64 + 0.5, frame.y0 as f64 + 0.5, frame.x1 as f64 - 0.5, frame.y1 as f64 - 0.5);
+        let inside = |x: f64, y: f64| m.sample(x, y).is_some_and(|s| (x0..=x1).contains(&s.p[0]) && (y0..=y1).contains(&s.p[1]));
+        (0..frame.width()).all(|i| {
+            let x = x0 + i as f64;
+            inside(x, y0) && inside(x, y1)
+        }) && (0..frame.height()).all(|j| {
+            let y = y0 + j as f64;
+            inside(x0, y) && inside(x1, y)
         })
     };
     if covers(lc.scale) {
-        // Shrink while it still covers (never below the user's 100 % baseline when it covers).
+        // Already covered at the user's scale: Auto Scale only enlarges.
         return lc.scale;
     }
     let (mut lo, mut hi) = (lc.scale, lc.scale);
@@ -269,6 +279,10 @@ const TILE: i32 = 128;
 /// to: samples clamp to it, and pixels mapping outside it take the edge mode. `map` returns where
 /// each output pixel centre samples (`None` = outside).
 pub fn remap(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &(dyn Fn(f64, f64) -> Option<Sample> + Sync)) -> Surface {
+    remap_impl(src, frame, out_area, edge, map, true)
+}
+
+fn remap_impl(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &(dyn Fn(f64, f64) -> Option<Sample> + Sync), shared: bool) -> Surface {
     let sfmt = src.format();
     let needs_alpha = matches!(edge, EdgeMode::Transparency) && !sfmt.alpha;
     let ofmt = if needs_alpha { PixelFormat::new(sfmt.mode, sfmt.sample, true) } else { sfmt };
@@ -363,7 +377,14 @@ pub fn remap(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &(
                 let fy = ((s.p[1] - fy0).min(fy1 - s.p[1]) + 0.5).clamp(0.0, 1.0);
                 (fx * fy) as f32
             };
-            let alpha = if sfmt.alpha { bicubic(n_in - 1, s.p).clamp(0.0, 1.0) } else { 1.0 };
+            // Color channels and coverage usually sample the same location. Prepare the 16
+            // tap addresses and weights once; each channel keeps its original summation order.
+            let center = if shared && (!rgb || (s.pr == s.p && s.pb == s.p)) { sample_channels(&buf, win, frame, n_in, s.p) } else { None };
+            let sample = |c: usize, p: [f64; 2]| {
+                let cached = if p == s.p { center.as_ref() } else { None };
+                cached.and_then(|v| v.get(c)).copied().unwrap_or_else(|| bicubic(c, p))
+            };
+            let alpha = if sfmt.alpha { sample(n_in - 1, s.p).clamp(0.0, 1.0) } else { 1.0 };
             let mut col = [0.0f32; 8];
             for (c, v) in col.iter_mut().enumerate().take(cc) {
                 let p = if rgb && c == 0 {
@@ -373,7 +394,7 @@ pub fn remap(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &(
                 } else {
                     s.p
                 };
-                let pm = bicubic(c, p);
+                let pm = sample(c, p);
                 let straight = if sfmt.alpha { if alpha > 1e-6 { pm / alpha } else { 0.0 } } else { pm };
                 let g = s.gain;
                 *v = if subtractive {
@@ -416,6 +437,41 @@ pub fn remap(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &(
     }
     out.prune();
     out
+}
+
+fn sample_channels(buf: &[f32], win: Rect, frame: Rect, n: usize, p: [f64; 2]) -> Option<[f32; 8]> {
+    match n {
+        1 => sample_channels_impl::<1>(buf, win, frame, p),
+        2 => sample_channels_impl::<2>(buf, win, frame, p),
+        3 => sample_channels_impl::<3>(buf, win, frame, p),
+        4 => sample_channels_impl::<4>(buf, win, frame, p),
+        5 => sample_channels_impl::<5>(buf, win, frame, p),
+        8 => sample_channels_impl::<8>(buf, win, frame, p),
+        _ => None,
+    }
+}
+fn sample_channels_impl<const N: usize>(buf: &[f32], win: Rect, frame: Rect, p: [f64; 2]) -> Option<[f32; 8]> {
+    if N == 0 || N > 8 || win.is_empty() || frame.is_empty() || !p.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let x = (p[0] - 0.5).clamp(frame.x0 as f64, frame.x1 as f64 - 1.0);
+    let y = (p[1] - 0.5).clamp(frame.y0 as f64, frame.y1 as f64 - 1.0);
+    let (xi, yi) = (x.floor(), y.floor());
+    let (wx, wy) = (catmull_rom((x - xi) as f32), catmull_rom((y - yi) as f32));
+    let mut acc = [0.0f32; 8];
+    for (j, wyv) in wy.iter().enumerate() {
+        let yy = ((yi as i32 + j as i32 - 1).clamp(win.y0, win.y1 - 1) - win.y0) as usize;
+        for (i, wxv) in wx.iter().enumerate() {
+            let xx = ((xi as i32 + i as i32 - 1).clamp(win.x0, win.x1 - 1) - win.x0) as usize;
+            let start = yy.checked_mul(win.width() as usize)?.checked_add(xx)?.checked_mul(N)?;
+            let px = buf.get(start..start.checked_add(N)?)?.first_chunk::<N>()?;
+            let weight = wxv * wyv;
+            for (a, v) in acc.iter_mut().zip(px) {
+                *a += weight * *v;
+            }
+        }
+    }
+    Some(acc)
 }
 
 /// Applies a lens correction to `src` over `frame` (normally the canvas).
@@ -522,3 +578,10 @@ mod tests {
         assert!(out.pixel(0, 0)[0] < 0.4 && (out.pixel(20, 20)[0] - 0.5).abs() < 0.02, "{:?}", out.pixel(0, 0));
     }
 }
+
+#[cfg(test)]
+mod shared_sample_tests;
+
+#[cfg(test)]
+#[path = "lens_auto_scale_tests.rs"]
+mod lens_auto_scale_tests;

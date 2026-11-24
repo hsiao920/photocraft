@@ -10,8 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::adjust::CurvePoint;
 
+/// The range of a style's pattern scale as a fraction (1 = 100 %): Pattern Overlay, a pattern
+/// Stroke and the Bevel & Emboss Texture all take 1..1000 % in the Layer Style dialog.
+pub const PATTERN_SCALE_RANGE: (f32, f32) = (0.01, 10.0);
+
 /// Gradient geometry (fill layers, gradient overlays, gradient strokes).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum GradientStyle {
     #[default]
     Linear,
@@ -22,7 +26,7 @@ pub enum GradientStyle {
 }
 
 /// A gradient: colour stops plus transparency stops (both at `0..=1`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct Gradient {
     pub stops: Vec<(f32, Color)>,
     /// Opacity stops; empty means fully opaque.
@@ -35,6 +39,16 @@ pub struct Gradient {
     pub align: bool,
     /// Centre offset as a fraction of the bounds.
     pub offset: (f32, f32),
+}
+
+/// Editable colour stops behind a Gradient Overlay's baked render stops.
+/// Older documents have no interpolation record and keep their existing appearance.
+/// Writers must rebake `gradient.stops` from this record, or clear it when replacing the curve.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
+pub struct GradientInterpolation {
+    pub method: String,
+    pub smoothness: f32,
+    pub stops: Vec<(f32, Color)>,
 }
 
 impl Default for Gradient {
@@ -53,16 +67,33 @@ impl Default for Gradient {
 }
 
 /// Effect contour (transfer curve applied to the effect's coverage).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum Contour {
     #[default]
     Linear,
     /// Custom curve (input → output), both `0..=1`.
-    Custom { name: String, points: Vec<CurvePoint> },
+    Custom {
+        name: String,
+        points: Vec<CurvePoint>,
+        /// Corner (non-continuous) flags, parallel to `points`: the curve bends sharply at a
+        /// corner point instead of passing smoothly through it. Missing entries are smooth.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        corners: Vec<bool>,
+    },
+}
+
+impl Contour {
+    /// Whether point `i` of a custom contour is a corner.
+    pub fn is_corner(&self, i: usize) -> bool {
+        match self {
+            Contour::Linear => false,
+            Contour::Custom { corners, .. } => corners.get(i).copied().unwrap_or(false),
+        }
+    }
 }
 
 /// Paint used by strokes and glows.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum FxPaint {
     Color(Color),
     Gradient(Gradient),
@@ -75,7 +106,7 @@ pub enum FxPaint {
 }
 
 /// Blend mode + opacity + enabled, shared by every effect.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct FxCommon {
     pub enabled: bool,
     pub blend: BlendMode,
@@ -88,7 +119,7 @@ impl FxCommon {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct Shadow {
     pub common: FxCommon,
     pub color: Color,
@@ -105,21 +136,21 @@ pub struct Shadow {
     pub knocks_out: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum GlowTechnique {
     #[default]
     Softer,
     Precise,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum GlowSource {
     Center,
     #[default]
     Edge,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct Glow {
     pub common: FxCommon,
     pub paint: FxPaint,
@@ -136,22 +167,25 @@ pub struct Glow {
     pub source: GlowSource,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum StrokePosition {
     Outside,
     Inside,
     Center,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct StrokeFx {
     pub common: FxCommon,
     pub size: f32,
     pub position: StrokePosition,
     pub paint: FxPaint,
+    /// Overprint (PSD `overprint`).
+    #[serde(default)]
+    pub overprint: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct Satin {
     pub common: FxCommon,
     pub color: Color,
@@ -163,7 +197,7 @@ pub struct Satin {
     pub invert: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum BevelStyle {
     OuterBevel,
     #[default]
@@ -173,7 +207,7 @@ pub enum BevelStyle {
     StrokeEmboss,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum BevelTechnique {
     #[default]
     Smooth,
@@ -181,7 +215,7 @@ pub enum BevelTechnique {
     ChiselSoft,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct Bevel {
     pub enabled: bool,
     pub style: BevelStyle,
@@ -196,6 +230,9 @@ pub struct Bevel {
     pub altitude: f32,
     pub use_global_light: bool,
     pub gloss_contour: Contour,
+    /// Gloss Contour › Anti-aliased (PSD `antialiasGloss`).
+    #[serde(default)]
+    pub gloss_anti_alias: bool,
     pub highlight: FxCommon,
     pub highlight_color: Color,
     pub shadow: FxCommon,
@@ -209,7 +246,7 @@ pub struct Bevel {
 }
 
 /// The Contour element of Bevel & Emboss.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct BevelContour {
     pub contour: Contour,
     /// Range `0..=1` (Photoshop's default 50 %): the part of the bevel the contour spans.
@@ -224,7 +261,7 @@ impl Default for BevelContour {
 }
 
 /// The Texture element of Bevel & Emboss.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct BevelTexture {
     pub name: String,
     pub id: String,
@@ -240,7 +277,7 @@ pub struct BevelTexture {
 
 /// One layer effect. Several instances of the same kind are allowed
 /// (Photoshop's multiple strokes/shadows/overlays).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub enum Effect {
     DropShadow(Shadow),
     InnerShadow(Shadow),
@@ -255,6 +292,8 @@ pub enum Effect {
         common: FxCommon,
         gradient: Gradient,
         dither: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interpolation: Option<GradientInterpolation>,
     },
     PatternOverlay {
         common: FxCommon,
@@ -276,6 +315,36 @@ pub enum Effect {
 }
 
 impl Effect {
+    /// This effect with its colours in `mode`'s model ([`Color::in_mode`]): a layer's effect
+    /// colours are in its document's mode, as Image › Mode keeps them.
+    pub fn in_mode(mut self, mode: photocraft_color::ColorMode) -> Effect {
+        let cc = |c: &mut Color| *c = c.in_mode(mode);
+        let paint = |p: &mut FxPaint| match p {
+            FxPaint::Color(c) => cc(c),
+            FxPaint::Gradient(g) => g.stops.iter_mut().for_each(|s| cc(&mut s.1)),
+            FxPaint::Pattern { .. } => {}
+        };
+        match &mut self {
+            Effect::DropShadow(s) | Effect::InnerShadow(s) => cc(&mut s.color),
+            Effect::OuterGlow(g) | Effect::InnerGlow(g) => paint(&mut g.paint),
+            Effect::Stroke(s) => paint(&mut s.paint),
+            Effect::ColorOverlay { color, .. } => cc(color),
+            Effect::GradientOverlay { gradient, interpolation, .. } => {
+                gradient.stops.iter_mut().for_each(|s| cc(&mut s.1));
+                if let Some(source) = interpolation {
+                    source.stops.iter_mut().for_each(|s| cc(&mut s.1));
+                }
+            }
+            Effect::Satin(s) => cc(&mut s.color),
+            Effect::BevelEmboss(b) => {
+                cc(&mut b.highlight_color);
+                cc(&mut b.shadow_color);
+            }
+            Effect::PatternOverlay { .. } => {}
+        }
+        self
+    }
+
     /// Whether this instance is switched on.
     pub fn enabled(&self) -> bool {
         match self {
@@ -285,6 +354,18 @@ impl Effect {
             Effect::ColorOverlay { common, .. } | Effect::GradientOverlay { common, .. } | Effect::PatternOverlay { common, .. } => common.enabled,
             Effect::Satin(s) => s.common.enabled,
             Effect::BevelEmboss(b) => b.enabled,
+        }
+    }
+
+    /// Switches this instance on or off, keeping its settings.
+    pub fn set_enabled(&mut self, on: bool) {
+        match self {
+            Effect::DropShadow(s) | Effect::InnerShadow(s) => s.common.enabled = on,
+            Effect::OuterGlow(g) | Effect::InnerGlow(g) => g.common.enabled = on,
+            Effect::Stroke(s) => s.common.enabled = on,
+            Effect::ColorOverlay { common, .. } | Effect::GradientOverlay { common, .. } | Effect::PatternOverlay { common, .. } => common.enabled = on,
+            Effect::Satin(s) => s.common.enabled = on,
+            Effect::BevelEmboss(b) => b.enabled = on,
         }
     }
 
@@ -328,7 +409,7 @@ pub fn yes() -> bool {
 }
 
 /// Document-wide light used by effects with `use_global_light`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, craft_ui_macros::PlainData)]
 pub struct GlobalLight {
     pub angle: f32,
     pub altitude: f32,

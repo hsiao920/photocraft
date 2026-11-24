@@ -63,7 +63,7 @@ fn main() {
     for size in [30.0f32, 300.0] {
         let x = c + rad - size * 2.0;
         let t = Instant::now();
-        let r = quick::quick_select(&sampler, canvas, &[(x, c - size), (x, c + size)], size, quick::WORK_PX).expect("region");
+        let r = quick::quick_select(&sampler, canvas, &[(x, c - size), (x, c + size)], size).expect("region");
         println!("quick selection stroke (brush {size} px): {:.2?}  (region {}x{})", t.elapsed(), r.bbox.width(), r.bbox.height());
     }
 
@@ -81,16 +81,15 @@ fn main() {
 
     // Refine edge on a 20 px band (selection = the object result as a surface).
     let sel = combine_region(None, Some(&obj), SelectionMode::Replace).expect("selection");
-    let content = sel.content_bounds();
     let p = RefineParams { radius: 20.0, smooth: 10.0, feather: 1.0, contrast: 10.0, ..Default::default() };
     let t = Instant::now();
-    let refined = matting::refine_mask(&sampler, &matting::surface_reader(&sel), content, canvas, &p).expect("refined");
+    let refined = matting::refine_surface(&sampler, &sel, canvas, &p, None).expect("allocation").expect("refined");
     println!("refine edge (radius 20): {:.2?}", t.elapsed());
     let t = Instant::now();
-    let _ = matting::refine_mask(&sampler, &matting::surface_reader(&sel), content, canvas, &RefineParams { smart_radius: true, ..p }).expect("refined");
+    let _ = matting::refine_surface(&sampler, &sel, canvas, &RefineParams { smart_radius: true, ..p }, None).expect("allocation").expect("refined");
     println!("refine edge (radius 20, smart): {:.2?}", t.elapsed());
     let t = Instant::now();
-    let dec = matting::decontaminate(&s, &refined, 20.0, 100.0);
+    let dec = matting::decontaminate_surface(&s, &refined, 20.0, 100.0);
     println!("decontaminate: {:.2?}  ({} tiles)", t.elapsed(), dec.tile_count());
 
     // Focus area.
